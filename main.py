@@ -49,7 +49,7 @@ active_jobs = {}
 async def download_image_from_url(url: str, max_size_mb: int = 10) -> tuple[bytes, str]:
     """Download ảnh từ URL và trả về bytes và content type"""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=300.0) as client:
             response = await client.get(url)
             response.raise_for_status()
             
@@ -200,8 +200,8 @@ async def recover_image(
                 seed=seed
             )
             
-            # Lấy ảnh kết quả từ ComfyUI
-            result_image_bytes = comfyui_client.get_image(result_filename)
+            # Lấy ảnh kết quả từ ComfyUI (sử dụng type="temp" vì ảnh được lưu tạm thời)
+            result_image_bytes = comfyui_client.get_image(result_filename, folder_type="temp")
             
             # Upload lên cloud storage
             final_filename = f"recovered_{job_id}.{file_extension}"
@@ -351,8 +351,8 @@ async def recover_image_from_url(request: ImageRecoveryFromURLRequest):
                 seed=request.seed
             )
             
-            # Lấy ảnh kết quả từ ComfyUI
-            result_image_bytes = comfyui_client.get_image(result_filename)
+            # Lấy ảnh kết quả từ ComfyUI (sử dụng type="temp" vì ảnh được lưu tạm thời)
+            result_image_bytes = comfyui_client.get_image(result_filename, folder_type="temp")
             
             # Upload lên cloud storage
             final_filename = f"recovered_{job_id}.{extension}"

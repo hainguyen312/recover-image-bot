@@ -101,8 +101,8 @@ Hãy gửi ảnh để bắt đầu! 🚀
         # Lấy settings hiện tại của user
         current_settings = self.user_sessions.get(user_id, {}).get('settings', {
             'strength': 0.8,
-            'steps': 20,
-            'guidance_scale': 7.5
+            'steps': 8,
+            'guidance_scale': 1.8
         })
         
         settings_text = f"""
@@ -163,6 +163,8 @@ Sẵn sàng xử lý ảnh! 🚀
         """Xử lý khi người dùng gửi ảnh"""
         user_id = update.effective_user.id
         
+        logger.info(f"User {user_id} sent photo")
+        
         # Lưu thông tin ảnh vào session
         if user_id not in self.user_sessions:
             self.user_sessions[user_id] = {'waiting_for_prompt': False}
@@ -174,11 +176,12 @@ Sẵn sàng xử lý ảnh! 🚀
         self.user_sessions[user_id]['photo_file_id'] = photo.file_id
         self.user_sessions[user_id]['waiting_for_prompt'] = True
         
+        logger.info(f"User {user_id} session updated: {self.user_sessions[user_id]}")
+        
         await update.message.reply_text(
-            "📸 **Ảnh đã được nhận!**\n\n"
-            "Bây giờ hãy gửi mô tả về việc phục hồi ảnh (prompt):\n\n"
-            "Ví dụ: \"restore this damaged photo, fix scratches, improve colors\"",
-            parse_mode=ParseMode.MARKDOWN
+            "Anh da duoc nhan!\n\n"
+            "Bay gio hay gui mo ta ve viec phuc hoi anh (prompt):\n\n"
+            "Vi du: \"restore this damaged photo, fix scratches, improve colors\""
         )
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -186,19 +189,25 @@ Sẵn sàng xử lý ảnh! 🚀
         user_id = update.effective_user.id
         text = update.message.text.strip()
         
+        # Debug logging
+        logger.info(f"User {user_id} sent text: '{text}'")
+        logger.info(f"User session: {self.user_sessions.get(user_id, 'No session')}")
+        
         # Kiểm tra nếu user đang nhập prompt
         if user_id in self.user_sessions and self.user_sessions[user_id].get('waiting_for_prompt'):
+            logger.info(f"Processing prompt for user {user_id}: '{text}'")
             await self.process_image_recovery(update, context, text)
             return
         
         # Xử lý các lệnh khác
         if text.startswith('/'):
             await update.message.reply_text(
-                "❓ Lệnh không được nhận diện. Sử dụng /help để xem danh sách lệnh."
+                "Lenh khong duoc nhan dien. Su dung /help de xem danh sach lenh."
             )
         else:
+            logger.info(f"User {user_id} sent unrecognized text, no session or not waiting for prompt")
             await update.message.reply_text(
-                "🤔 Tôi không hiểu. Hãy gửi ảnh để bắt đầu phục hồi hoặc sử dụng /help để xem hướng dẫn."
+                "Toi khong hieu. Hay gui anh de bat dau phuc hoi hoac su dung /help de xem huong dan."
             )
     
     async def process_image_recovery(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
@@ -208,9 +217,9 @@ Sẵn sàng xử lý ảnh! 🚀
         try:
             # Gửi thông báo đang xử lý
             processing_msg = await update.message.reply_text(
-                "🔄 **Đang xử lý ảnh...**\n\n"
-                "Quá trình này có thể mất 30-60 giây.\n"
-                "Vui lòng chờ trong giây lát... ⏳",
+                "Dang xu ly anh...\n\n"
+                "Qua trinh nay co the mat 3-5 phut.\n"
+                "Vui long cho trong giay lat...",
                 parse_mode=ParseMode.MARKDOWN
             )
             
@@ -221,6 +230,9 @@ Sẵn sàng xử lý ảnh! 🚀
             # Download ảnh
             image_bytes = await file.download_as_bytearray()
             
+            # Convert bytearray to bytes for httpx
+            image_data = bytes(image_bytes)
+            
             # Lấy settings của user
             settings = self.user_sessions.get(user_id, {}).get('settings', {
                 'strength': 0.8,
@@ -228,10 +240,10 @@ Sẵn sàng xử lý ảnh! 🚀
                 'guidance_scale': 7.5
             })
             
-            # Gọi API phục hồi ảnh
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            # Gọi API phục hồi ảnh (tăng timeout cho ComfyUI)
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 files = {
-                    'image': ('image.jpg', image_bytes, 'image/jpeg')
+                    'image': ('image.jpg', image_data, 'image/jpeg')
                 }
                 data = {
                     'prompt': prompt,

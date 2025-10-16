@@ -14,6 +14,37 @@ class StorageService(ABC):
         """Upload ảnh và trả về URL"""
         pass
 
+class LocalStorageService(StorageService):
+    """Local storage implementation cho testing"""
+    
+    def __init__(self):
+        self.output_dir = "output_images"
+        os.makedirs(self.output_dir, exist_ok=True)
+        logger.info("Local Storage initialized successfully")
+    
+    async def upload_image(self, image_bytes: bytes, filename: str, content_type: str = "image/png") -> str:
+        """Lưu ảnh vào thư mục local và trả về đường dẫn"""
+        try:
+            import uuid
+            import time
+            
+            # Tạo tên file unique
+            timestamp = int(time.time())
+            unique_filename = f"{timestamp}_{filename}"
+            file_path = os.path.join(self.output_dir, unique_filename)
+            
+            # Lưu file
+            with open(file_path, 'wb') as f:
+                f.write(image_bytes)
+            
+            # Trả về đường dẫn file (trong thực tế sẽ là URL)
+            logger.info(f"Image saved locally: {file_path}")
+            return f"file://{os.path.abspath(file_path)}"
+            
+        except Exception as e:
+            logger.error(f"Failed to save image locally: {str(e)}")
+            raise
+
 class FirebaseStorageService(StorageService):
     """Firebase Storage implementation"""
     
@@ -72,10 +103,16 @@ class FirebaseStorageService(StorageService):
 
 
 def get_storage_service() -> StorageService:
-    """Factory function để tạo storage service - chỉ sử dụng Firebase"""
+    """Factory function để tạo storage service"""
+    # Thử Firebase trước, nếu lỗi thì dùng Local storage
     try:
         logger.info("Initializing Firebase Storage service...")
         return FirebaseStorageService()
     except Exception as e:
-        logger.error(f"Failed to initialize Firebase Storage: {str(e)}")
-        raise Exception("Cannot initialize Firebase Storage service")
+        logger.warning(f"Failed to initialize Firebase Storage: {str(e)}")
+        logger.info("Falling back to Local Storage for testing...")
+        try:
+            return LocalStorageService()
+        except Exception as local_e:
+            logger.error(f"Failed to initialize Local Storage: {str(local_e)}")
+            raise Exception("Cannot initialize any storage service")
