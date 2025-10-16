@@ -6,6 +6,7 @@
 # Credentials and secrets
 credentials/
 *.json
+!workflows/*.json
 *.pem
 *.key
 firebase-service-account.json
