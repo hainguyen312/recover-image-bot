@@ -134,7 +134,7 @@ class ComfyUIClient:
         """Tạo workflow cho phục hồi ảnh"""
         
         # Thử load workflow từ file JSON trước
-        workflow_file = "workflows/image_recovery_workflow.json"
+        workflow_file = "workflows/Restore.json"
         try:
             with open(workflow_file, 'r') as f:
                 workflow = json.load(f)
@@ -271,24 +271,57 @@ class ComfyUIClient:
                                    guidance_scale: float, seed: Optional[int]) -> None:
         """Cập nhật parameters trong workflow"""
         
-        # Tìm và cập nhật các node cần thiết
-        for node_id, node_data in workflow.items():
-            if node_data.get("class_type") == "LoadImage":
-                # Cập nhật đường dẫn ảnh input
-                node_data["inputs"]["image"] = input_image_path
+        # Xử lý format workflow thực tế của ComfyUI
+        if "nodes" in workflow:
+            # Format mới: {"nodes": [...], "links": [...]}
+            for node in workflow["nodes"]:
+                node_type = node.get("type", "")
                 
-            elif node_data.get("class_type") == "CLIPTextEncode":
-                # Cập nhật prompt (thường là node đầu tiên)
-                if "text" in node_data["inputs"] and not node_data["inputs"]["text"]:
-                    node_data["inputs"]["text"] = prompt
+                if node_type == "LoadImage":
+                    # Cập nhật đường dẫn ảnh input
+                    if "widgets_values" in node and len(node["widgets_values"]) > 0:
+                        node["widgets_values"][0] = input_image_path
                     
-            elif node_data.get("class_type") == "KSampler":
-                # Cập nhật sampling parameters
-                node_data["inputs"]["steps"] = steps
-                node_data["inputs"]["cfg"] = guidance_scale
-                if seed is not None:
-                    node_data["inputs"]["seed"] = seed
+                elif node_type == "CLIPTextEncode":
+                    # Cập nhật prompt
+                    if "widgets_values" in node and len(node["widgets_values"]) > 0:
+                        # Tìm node có prompt về restore
+                        current_text = node["widgets_values"][0]
+                        if "restore" in current_text.lower() or "photo" in current_text.lower():
+                            node["widgets_values"][0] = prompt
                     
-            elif node_data.get("class_type") == "ControlNetApply":
-                # Cập nhật strength
-                node_data["inputs"]["strength"] = strength
+                elif node_type == "KSampler":
+                    # Cập nhật sampling parameters
+                    if "widgets_values" in node:
+                        if len(node["widgets_values"]) >= 6:
+                            if seed is not None:
+                                node["widgets_values"][0] = seed
+                            node["widgets_values"][2] = steps
+                            node["widgets_values"][3] = guidance_scale
+                    
+                elif "ControlNetApply" in node_type:
+                    # Cập nhật strength
+                    if "widgets_values" in node and len(node["widgets_values"]) > 0:
+                        node["widgets_values"][0] = strength
+        else:
+            # Format cũ: {"1": {...}, "2": {...}}
+            for node_id, node_data in workflow.items():
+                if node_data.get("class_type") == "LoadImage":
+                    # Cập nhật đường dẫn ảnh input
+                    node_data["inputs"]["image"] = input_image_path
+                    
+                elif node_data.get("class_type") == "CLIPTextEncode":
+                    # Cập nhật prompt (thường là node đầu tiên)
+                    if "text" in node_data["inputs"] and not node_data["inputs"]["text"]:
+                        node_data["inputs"]["text"] = prompt
+                        
+                elif node_data.get("class_type") == "KSampler":
+                    # Cập nhật sampling parameters
+                    node_data["inputs"]["steps"] = steps
+                    node_data["inputs"]["cfg"] = guidance_scale
+                    if seed is not None:
+                        node_data["inputs"]["seed"] = seed
+                        
+                elif node_data.get("class_type") == "ControlNetApply":
+                    # Cập nhật strength
+                    node_data["inputs"]["strength"] = strength

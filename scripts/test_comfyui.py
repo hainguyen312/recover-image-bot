@@ -75,7 +75,7 @@ def test_workflow_file():
     print("\n📋 Test workflow file")
     print("=" * 50)
     
-    workflow_file = "workflows/image_recovery_workflow.json"
+    workflow_file = "workflows/Restore.json"
     
     if not os.path.exists(workflow_file):
         print(f"❌ Không tìm thấy workflow file: {workflow_file}")
@@ -92,9 +92,18 @@ def test_workflow_file():
         
         # Kiểm tra các node quan trọng
         node_types = {}
-        for node_id, node_data in workflow.items():
-            class_type = node_data.get("class_type", "Unknown")
-            node_types[class_type] = node_types.get(class_type, 0) + 1
+        
+        # Xử lý format workflow thực tế của ComfyUI
+        if "nodes" in workflow:
+            # Format mới: {"nodes": [...], "links": [...]}
+            for node in workflow["nodes"]:
+                class_type = node.get("type", "Unknown")
+                node_types[class_type] = node_types.get(class_type, 0) + 1
+        else:
+            # Format cũ: {"1": {...}, "2": {...}}
+            for node_id, node_data in workflow.items():
+                class_type = node_data.get("class_type", "Unknown")
+                node_types[class_type] = node_types.get(class_type, 0) + 1
         
         print("   - Các node types:")
         for class_type, count in node_types.items():
