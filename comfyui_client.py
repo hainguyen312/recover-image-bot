@@ -603,22 +603,22 @@ class ComfyUIClient:
                         widgets = node["widgets_values"]
                         logger.info(f"StringFunction node {node_id}: widgets = {widgets}")
                         logger.info(f"StringFunction node {node_id}: USER INPUT - Setting text_b = '{prompt}'")
-                        logger.info(f"StringFunction node {node_id}: KEEPING ORIGINAL - text_a = '{widgets[2]}', text_c = '{widgets[3]}'")
+                        logger.info(f"StringFunction node {node_id}: KEEPING ORIGINAL - text_a = '{widgets[2]}', text_c = '{widgets[4]}'")
                         converted_node["inputs"]["action"] = widgets[0]      # "append"
                         converted_node["inputs"]["tidy_tags"] = widgets[1]  # "yes" 
                         converted_node["inputs"]["text_a"] = widgets[2]     # KEEP ORIGINAL
                         converted_node["inputs"]["text_b"] = prompt         # USER PROMPT
-                        converted_node["inputs"]["text_c"] = widgets[3]     # KEEP ORIGINAL
+                        converted_node["inputs"]["text_c"] = widgets[4]     # KEEP ORIGINAL
                     
 
                 elif node_type == "KSampler":
 
-                    # Cập nhật sampling parameters cho CẢ 2 KSampler
+                    # Giữ nguyên toàn bộ thông số sampler theo mặc định trong workflow
                     if "widgets_values" in node and len(node["widgets_values"]) >= 6:
                         widgets = node["widgets_values"]
-                        converted_node["inputs"]["seed"] = seed if seed is not None else widgets[0]
-                        converted_node["inputs"]["steps"] = widgets[2]  # Giữ nguyên steps từ workflow
-                        converted_node["inputs"]["cfg"] = widgets[3]   # Giữ nguyên cfg từ workflow
+                        converted_node["inputs"]["seed"] = widgets[0]
+                        converted_node["inputs"]["steps"] = widgets[2]
+                        converted_node["inputs"]["cfg"] = widgets[3]
                         converted_node["inputs"]["sampler_name"] = widgets[4]
                         converted_node["inputs"]["scheduler"] = widgets[5]
                         converted_node["inputs"]["denoise"] = widgets[6] if len(widgets) > 6 else 1.0
@@ -626,9 +626,8 @@ class ComfyUIClient:
 
                 elif "ControlNetApply" in node_type:
 
-                    # Cập nhật strength
-
-                    converted_node["inputs"]["strength"] = strength
+                    # Giữ nguyên strength mặc định trong workflow
+                    pass
                 
                 # Thêm các inputs khác từ widgets_values
                 if "widgets_values" in node and node["widgets_values"]:
@@ -767,37 +766,24 @@ class ComfyUIClient:
 
                     node_data["inputs"]["image"] = input_image_path
 
-                    
+                
 
                 elif node_data.get("class_type") == "CLIPTextEncode":
 
-                    # Cập nhật prompt (thường là node đầu tiên)
-
-                    if "text" in node_data["inputs"] and not node_data["inputs"]["text"]:
-
-                        node_data["inputs"]["text"] = prompt
-
-                        
+                    # Không động chạm prompt mặc định trong workflow
+                    pass
+                
 
                 elif node_data.get("class_type") == "KSampler":
 
-                    # Cập nhật sampling parameters
-
-                    node_data["inputs"]["steps"] = steps
-
-                    node_data["inputs"]["cfg"] = guidance_scale
-
-                    if seed is not None:
-
-                        node_data["inputs"]["seed"] = seed
-
-                        
+                    # Giữ nguyên thông số sampler mặc định
+                    pass
+                
 
                 elif node_data.get("class_type") == "ControlNetApply":
 
-                    # Cập nhật strength
-
-                    node_data["inputs"]["strength"] = strength
+                    # Giữ nguyên strength mặc định
+                    pass
 
             
             return workflow
