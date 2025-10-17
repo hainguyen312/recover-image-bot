@@ -76,11 +76,6 @@ Hãy gửi ảnh để bắt đầu! 🚀
 - Mô tả chi tiết về việc phục hồi
 - Ví dụ: "restore this damaged photo, fix scratches, improve colors"
 
-**Bước 3: Chọn tham số (tùy chọn)**
-- Strength: Độ mạnh phục hồi (0.1-1.0)
-- Steps: Số bước xử lý (1-50)
-- Guidance: Tỷ lệ hướng dẫn (1.0-20.0)
-
 **Ví dụ prompt tốt:**
 ✅ "restore this old photo, fix scratches and stains, enhance colors"
 ✅ "improve image quality, remove noise, make it sharper"
