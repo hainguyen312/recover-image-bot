@@ -232,8 +232,8 @@ Sẵn sàng xử lý ảnh! 🚀
                 await file.download_to_drive(local_path)
 
                 client = ComfyUIClient()
-                # Gọi xử lý với Restore.json
-                result_filename = client.process_image_recovery(
+                # Chạy đúng workflow export gốc, chỉ ghi đè filename ảnh và text_b
+                result_filename = client.process_image_recovery_exact(
                     input_image_path=local_path,
                     prompt=prompt
                 )

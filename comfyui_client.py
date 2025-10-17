@@ -195,6 +195,54 @@ class ComfyUIClient:
         raise Exception(f"Timeout waiting for ComfyUI completion after {timeout} seconds")
 
     
+    def process_image_recovery_exact(self, input_image_path: str, prompt: Optional[str] = None) -> str:
+        """Chạy workflow đúng theo JSON export gốc (workflows/Restore.json),
+        chỉ ghi đè 2 chỗ: filename trong node LoadImage và text_b của node StringFunction|pysssss.
+
+        Trả về filename ảnh kết quả trên server ComfyUI.
+        """
+        try:
+            # Import nội bộ để tránh vòng lặp import
+            from run_workflow import (
+                apply_overrides_to_workflow,
+                upload_image,
+                post_prompt,
+                wait_for_completion,
+                select_result_filename,
+            )
+
+            # 1) Đọc workflow export gốc
+            workflow_file = "workflows/Restore.json"
+            with open(workflow_file, "r", encoding="utf-8") as f:
+                workflow = json.load(f)
+
+            # 2) Upload ảnh input lên ComfyUI để có filename trên server
+            if not input_image_path:
+                raise Exception("input_image_path is required")
+            image_filename = upload_image(self.server_url, input_image_path)
+
+            # 3) Ghi đè đúng 2 chỗ trong workflow
+            workflow = apply_overrides_to_workflow(
+                workflow,
+                image_filename=image_filename,
+                prompt_text=prompt,
+            )
+
+            # 4) Gửi prompt và đợi hoàn tất
+            prompt_id = post_prompt(self.server_url, workflow)
+            result = wait_for_completion(self.server_url, prompt_id)
+
+            # 5) Chọn filename ảnh output
+            filename = select_result_filename(result)
+            if not filename:
+                raise Exception("Không tìm thấy ảnh output trong kết quả.")
+
+            return filename
+
+        except Exception as e:
+            logger.error(f"Error in process_image_recovery_exact: {str(e)}")
+            raise
+
 
     def process_image_recovery(self, input_image_path: str, prompt: str, 
 
