@@ -299,17 +299,21 @@ class ComfyUIClient:
                     if images:
                         filename = images[0]['filename']
                         logger.info(f"Found image filename in node {node_id}: {filename}")
-                        image_nodes.append((int(node_id), filename))
-            
-            # Ưu tiên node 18 (RESULT) trước, sau đó node 19 (ORIGINAL IMAGE)
+                        try:
+                            nid_int = int(node_id)
+                        except Exception:
+                            nid_int = None
+                        # Bỏ qua node 19 (ORIGINAL IMAGE)
+                        if nid_int == 19:
+                            logger.info("Skipping ORIGINAL IMAGE from node 19")
+                            continue
+                        # Nếu là node 18 (RESULT) thì chọn ngay
+                        if nid_int == 18:
+                            logger.info(f"Selected RESULT image from node 18: {filename}")
+                            return filename
+                        image_nodes.append((nid_int if nid_int is not None else node_id, filename))
+            # Nếu không có node 18, lấy node hợp lệ đầu tiên (đã loại node 19)
             if image_nodes:
-                # Tìm node 18 trước (RESULT)
-                for node_id, filename in image_nodes:
-                    if node_id == 18:
-                        logger.info(f"Selected RESULT image from node 18: {filename}")
-                        return filename
-                
-                # Nếu không có node 18, lấy node đầu tiên
                 final_node_id, final_filename = image_nodes[0]
                 logger.info(f"Selected image from node {final_node_id}: {final_filename}")
                 return final_filename
