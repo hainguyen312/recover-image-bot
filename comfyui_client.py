@@ -617,20 +617,12 @@ class ComfyUIClient:
 
                 elif node_type == "KSampler":
 
-                    # Giữ nguyên toàn bộ thông số sampler theo mặc định trong workflow
-                    if "widgets_values" in node and len(node["widgets_values"]) >= 6:
-                        widgets = node["widgets_values"]
-                        converted_node["inputs"]["seed"] = widgets[0]
-                        converted_node["inputs"]["steps"] = widgets[2]
-                        converted_node["inputs"]["cfg"] = widgets[3]
-                        converted_node["inputs"]["sampler_name"] = widgets[4]
-                        converted_node["inputs"]["scheduler"] = widgets[5]
-                        converted_node["inputs"]["denoise"] = widgets[6] if len(widgets) > 6 else 1.0
-                    
+                    # Giữ nguyên tham số mặc định trong workflow (không chỉnh sửa tại đây)
+                    pass
 
                 elif "ControlNetApply" in node_type:
 
-                    # Giữ nguyên strength mặc định trong workflow
+                    # Giữ nguyên strength/start/end mặc định trong workflow (không chỉnh sửa tại đây)
                     pass
                 
                 # Thêm các inputs khác từ widgets_values
@@ -687,20 +679,24 @@ class ComfyUIClient:
                     
                     elif node_type == "easy float":
                         if len(widgets) >= 1:
+                            logger.info(f"easy float node {node_id}: USING DEFAULT value={widgets[0]}")
                             converted_node["inputs"]["value"] = widgets[0]
                     
                     elif node_type == "LayerFilter: GaussianBlurV2":
                         if len(widgets) >= 1:
+                            logger.info(f"GaussianBlurV2 node {node_id}: USING DEFAULT blur={widgets[0]}")
                             converted_node["inputs"]["blur"] = widgets[0]
                     
                     elif node_type == "LayerFilter: AddGrain":
                         if len(widgets) >= 3:
+                            logger.info(f"AddGrain node {node_id}: USING DEFAULTS power={widgets[0]}, scale={widgets[1]}, sat={widgets[2]}")
                             converted_node["inputs"]["grain_power"] = widgets[0]
                             converted_node["inputs"]["grain_scale"] = widgets[1]
                             converted_node["inputs"]["grain_sat"] = widgets[2]
                     
                     elif node_type == "FluxGuidance":
                         if len(widgets) >= 1:
+                            logger.info(f"FluxGuidance node {node_id}: USING DEFAULT guidance={widgets[0]}")
                             converted_node["inputs"]["guidance"] = widgets[0]
                     
                     elif node_type == "ImageQuantize":
@@ -720,6 +716,7 @@ class ComfyUIClient:
                     
                     elif node_type == "LoraLoader":
                         if len(widgets) >= 5:
+                            logger.info(f"LoraLoader node {node_id}: USING DEFAULTS lora={widgets[0]}, sm={widgets[1]}, sc={widgets[2]}")
                             converted_node["inputs"]["lora_name"] = widgets[0]
                             converted_node["inputs"]["strength_model"] = widgets[1]
                             converted_node["inputs"]["strength_clip"] = widgets[2]
@@ -734,7 +731,7 @@ class ComfyUIClient:
                     
                     elif node_type == "UNETLoader":
                         if len(widgets) >= 2:
-                            logger.info(f"UNETLoader node {node_id}: Setting unet_name = '{widgets[0]}', weight_dtype = '{widgets[1]}'")
+                            logger.info(f"UNETLoader node {node_id}: USING DEFAULTS unet={widgets[0]}, dtype={widgets[1]}")
                             converted_node["inputs"]["unet_name"] = widgets[0]
                             converted_node["inputs"]["weight_dtype"] = widgets[1]
                 
@@ -774,7 +771,7 @@ class ComfyUIClient:
 
                 elif node_data.get("class_type") == "CLIPTextEncode":
 
-                    # Không động chạm prompt mặc định trong workflow
+                    # Giữ nguyên prompt mặc định trong workflow
                     pass
                 
 
@@ -788,7 +785,21 @@ class ComfyUIClient:
 
                     # Giữ nguyên strength mặc định
                     pass
+                
+                elif node_type == "VAEDecode":
+                    # Giữ nguyên mặc định; mọi kết nối sẽ được map từ links phía dưới
+                    logger.info(f"VAEDecode node {node_id}: KEEPING DEFAULTS (no widget values)")
+                    pass
 
+                elif node_type == "VAEEncode":
+                    # Giữ nguyên mặc định; mọi kết nối sẽ được map từ links phía dưới
+                    logger.info(f"VAEEncode node {node_id}: KEEPING DEFAULTS (no widget values)")
+                    pass
+
+                elif node_type == "VAELoader":
+                    # Đã có xử lý lấy vae_name từ widgets_values ở phần dưới; không sửa gì thêm
+                    logger.info(f"VAELoader node {node_id}: USING DEFAULTS FROM WORKFLOW")
+                    pass
             
             return workflow
 

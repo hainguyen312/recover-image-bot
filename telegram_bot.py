@@ -12,6 +12,8 @@ from io import BytesIO
 from PIL import Image
 
 from config import config
+from storage_service import get_storage_service
+from comfyui_client import ComfyUIClient
 
 # Thiết lập logging
 logging.basicConfig(
@@ -26,6 +28,8 @@ class TelegramBot:
         self.api_base_url = api_base_url
         self.application = None
         self.user_sessions = {}  # Lưu trữ session của người dùng
+        # Khởi tạo storage service (Firebase nếu có, fallback Local)
+        self.storage = get_storage_service()
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Xử lý lệnh /start"""
@@ -206,101 +210,59 @@ Sẵn sàng xử lý ảnh! 🚀
             )
     
     async def process_image_recovery(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-        """Xử lý phục hồi ảnh"""
+        """Xử lý phục hồi ảnh trực tiếp với ComfyUI bằng workflow Restore.json.
+        Chỉ thay ảnh đầu vào và text_b của node StringFunction|pysssss."""
         user_id = update.effective_user.id
-        
         try:
-            # Gửi thông báo đang xử lý
             processing_msg = await update.message.reply_text(
-                "Dang xu ly anh...\n\n"
-                "Qua trinh nay co the mat 3-5 phut.\n"
-                "Vui long cho trong giay lat...",
+                "Đang xử lý ảnh... Vui lòng chờ trong giây lát...",
                 parse_mode=ParseMode.MARKDOWN
             )
-            
-            # Lấy ảnh từ Telegram
+
             photo_file_id = self.user_sessions[user_id]['photo_file_id']
             file = await context.bot.get_file(photo_file_id)
-            
-            # Download ảnh
-            image_bytes = await file.download_as_bytearray()
-            
-            # Convert bytearray to bytes for httpx
-            image_data = bytes(image_bytes)
-            
-            # Lấy settings của user
-            settings = self.user_sessions.get(user_id, {}).get('settings', {
-                'strength': 0.8,
-                'steps': 20,
-                'guidance_scale': 7.5
-            })
-            
-            # Gọi API phục hồi ảnh (tăng timeout cho ComfyUI)
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                files = {
-                    'image': ('image.jpg', image_data, 'image/jpeg')
-                }
-                data = {
-                    'prompt': prompt,
-                    'strength': settings['strength'],
-                    'steps': settings['steps'],
-                    'guidance_scale': settings['guidance_scale']
-                }
-                
-                response = await client.post(
-                    f"{self.api_base_url}/recover-image",
-                    files=files,
-                    data=data
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                local_path = os.path.join(tmpdir, "input.jpg")
+                await file.download_to_drive(local_path)
+
+                client = ComfyUIClient()
+                # Gọi xử lý với Restore.json
+                result_filename = client.process_image_recovery(
+                    input_image_path=local_path,
+                    prompt=prompt
                 )
-            
-            # Xóa thông báo đang xử lý
+
+                # Tải ảnh kết quả từ ComfyUI
+                img_bytes = client.get_image(result_filename)
+
             await processing_msg.delete()
-            
-            if response.status_code == 200:
-                result = response.json()
-                
-                if result['success']:
-                    # Gửi kết quả thành công
-                    success_text = f"""
-✅ **Phục hồi ảnh thành công!**
 
-⏱️ **Thời gian xử lý:** {result['processing_time']:.1f} giây
-🆔 **Job ID:** `{result['job_id']}`
-
-**Prompt đã sử dụng:** {prompt}
-
-Kết quả sẽ được gửi trong giây lát... 🎉
-                    """
-                    
-                    await update.message.reply_text(
-                        success_text,
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                    
-                    # Gửi ảnh kết quả
-                    await update.message.reply_photo(
-                        photo=result['result_image_url'],
-                        caption=f"🎨 **Ảnh đã được phục hồi!**\n\nPrompt: {prompt}"
-                    )
-                    
-                    # Reset session
-                    self.user_sessions[user_id]['waiting_for_prompt'] = False
-                    del self.user_sessions[user_id]['photo_file_id']
-                    
-                else:
-                    await update.message.reply_text(
-                        f"❌ **Lỗi xử lý ảnh:**\n\n{result['message']}",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-            else:
-                await update.message.reply_text(
-                    f"❌ **Lỗi API:** HTTP {response.status_code}\n\n{response.text}"
+            # Upload ảnh kết quả lên storage để lấy URL
+            try:
+                public_url = await self.storage.upload_image(img_bytes, result_filename, content_type="image/png")
+            except Exception:
+                # Nếu upload lỗi, gửi ảnh trực tiếp như fallback
+                await update.message.reply_photo(
+                    photo=BytesIO(img_bytes),
+                    caption=f"🎨 Ảnh đã được phục hồi!\n\nPrompt: {prompt}"
                 )
-                
+            else:
+                # Gửi ảnh qua URL
+                await update.message.reply_photo(
+                    photo=public_url,
+                    caption=f"🎨 Ảnh đã được phục hồi!\n\nPrompt: {prompt}"
+                )
+
+            self.user_sessions[user_id]['waiting_for_prompt'] = False
+            if 'photo_file_id' in self.user_sessions[user_id]:
+                del self.user_sessions[user_id]['photo_file_id']
+
         except Exception as e:
             logger.error(f"Error processing image recovery: {str(e)}")
             await update.message.reply_text(
-                f"❌ **Đã xảy ra lỗi:**\n\n{str(e)}\n\nVui lòng thử lại sau."
+                f"❌ **Đã xảy ra lỗi:**\n\n{str(e)}\n\nVui lòng thử lại sau.",
+                parse_mode=ParseMode.MARKDOWN
             )
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
