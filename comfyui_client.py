@@ -7,6 +7,12 @@ import logging
 from typing import Dict, Any, Optional
 from config import config
 
+# websocket-client may not be installed in all environments; import safely
+try:
+    import websocket
+except Exception:
+    websocket = None
+
 logger = logging.getLogger(__name__)
 
 class ComfyUIClient:
@@ -33,18 +39,15 @@ class ComfyUIClient:
             return False
         
     def clear_cache(self) -> bool:
-        """Xóa cache ComfyUI để đảm bảo workflow chạy đầy đủ"""
-        try:
-            # Gửi request để clear cache
-            url = f"{self.server_url}/system_stats"
-            response = requests.get(url, timeout=self.timeout)
-            if response.status_code == 200:
-                logger.info("ComfyUI cache cleared")
-                return True
-            return False
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Could not clear cache: {e}")
-            return False
+        """No-op: cache clearing disabled.
+
+        Historically this method sent a GET to /system_stats to trigger a cache
+        clear on ComfyUI. That behavior is disabled because it can cause
+        unwanted side-effects. The method remains for compatibility and simply
+        logs that cache clearing is skipped.
+        """
+        logger.info("clear_cache is disabled; skipping cache clear")
+        return False
         
     def queue_prompt(self, prompt: Dict[str, Any]) -> str:
         """Gửi prompt đến ComfyUI và nhận về prompt_id"""
@@ -134,15 +137,22 @@ class ComfyUIClient:
         """Lấy thông tin progress hiện tại của ComfyUI"""
         try:
             response = requests.get(f"{self.server_url}/progress", timeout=self.timeout)
-            
+
             if response.status_code == 200:
-                return response.json()
+                try:
+                    return response.json()
+                except Exception as e:
+                    logger.warning(f"Progress endpoint returned non-JSON body: {e}; raw={response.text}")
+                    return {}
             else:
-                raise Exception(f"Failed to get progress: {response.text}")
-                
-        except Exception as e:
-            logger.error(f"Error getting progress: {str(e)}")
-            raise
+                # Do not raise here; return empty dict and log details so callers can retry gracefully
+                logger.warning(f"Failed to get progress: HTTP {response.status_code}; body={response.text}")
+                return {}
+
+        except requests.exceptions.RequestException as e:
+            # Network level errors (timeout, connection error) should be logged and returned as empty progress
+            logger.warning(f"Network error getting progress from {self.server_url}/progress: {e}")
+            return {}
     
     def wait_for_completion(self, prompt_id: str, timeout: int = 300) -> Dict[str, Any]:
         """Đợi cho đến khi xử lý hoàn tất"""
@@ -174,44 +184,232 @@ class ComfyUIClient:
     
     def wait_for_completion_with_progress(self, prompt_id: str, progress_callback=None, timeout: int = 300) -> Dict[str, Any]:
         """Đợi cho đến khi xử lý hoàn tất với callback để hiển thị progress"""
+        # First, try to use WebSocket to receive live progress messages from ComfyUI.
+        # If websocket-client is not available or WS connection fails, fall back to HTTP polling.
         start_time = time.time()
-        
-        while time.time() - start_time < timeout:
+
+        def _http_polling():
+            # Fallback polling: /progress may not exist on ComfyUI; only poll /history for completion.
+            while time.time() - start_time < timeout:
+                try:
+                    # Check history - tolerate failures here too (log and continue)
+                    try:
+                        history = self.get_history(prompt_id)
+                    except Exception as hist_e:
+                        logger.warning(f"Failed to fetch history during polling: {hist_e}")
+                        history = {}
+
+                    if prompt_id in history:
+                        prompt_data = history[prompt_id]
+                        if 'status' in prompt_data:
+                            status = prompt_data['status']
+                            if status.get('status_str') == 'success':
+                                return prompt_data
+                            elif status.get('status_str') == 'error':
+                                error_message = status.get('messages', ['Unknown error'])
+                                raise Exception(f"ComfyUI processing failed: {error_message}")
+
+                    time.sleep(2)
+                except Exception as e:
+                    logger.error(f"Error waiting for completion (HTTP fallback): {str(e)}")
+                    raise
+
+            raise Exception(f"Timeout waiting for ComfyUI completion after {timeout} seconds")
+
+        # If websocket-client is available, try using it to listen to /ws
+        if websocket is None:
+            logger.info("websocket-client not installed; using HTTP polling for progress")
+            return _http_polling()
+
+        # Build WS URL from server_url, converting http->ws and https->wss when needed
+        base = self.server_url.rstrip('/')
+        if base.startswith('https://'):
+            ws_base = 'wss://' + base[len('https://'):]
+        elif base.startswith('http://'):
+            ws_base = 'ws://' + base[len('http://'):]
+        else:
+            ws_base = base
+
+        ws_url = f"{ws_base}/ws?clientId={self.client_id}"
+
+        try:
+            # create a blocking WebSocket connection with a small recv timeout
+            ws = websocket.create_connection(ws_url, timeout=5)
+        except Exception as e:
+            logger.warning(f"Could not open WebSocket to ComfyUI ({ws_url}): {e}; falling back to HTTP polling")
+            return _http_polling()
+
+        # set a short socket timeout to allow timeout checks
+        try:
+            ws.settimeout(2)
+        except Exception:
+            pass
+
+        try:
+            while time.time() - start_time < timeout:
+                try:
+                    raw = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    # no message in this interval; continue and check time
+                    continue
+                except Exception as e:
+                    logger.warning(f"WebSocket recv error: {e}")
+                    break
+
+                if not raw:
+                    continue
+
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    # not JSON — ignore
+                    continue
+
+                mtype = msg.get('type')
+
+                # progress messages: {type: 'progress', data: {value, max}}
+                if mtype == 'progress':
+                    data = msg.get('data', {})
+                    if progress_callback:
+                        try:
+                            progress_callback(data)
+                        except Exception as cb_e:
+                            logger.warning(f"progress_callback raised: {cb_e}")
+
+                # executing messages indicate when nodes/prompt start/finish
+                elif mtype == 'executing':
+                    data = msg.get('data', {})
+                    # When data['node'] is null and prompt_id matches, execution finished
+                    if data.get('prompt_id') == prompt_id and data.get('node') is None:
+                        # Fetch final history to return detailed result
+                        try:
+                            history = self.get_history(prompt_id)
+                            if prompt_id in history:
+                                return history[prompt_id]
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch history after WS executing message: {e}")
+                        # if history fetch failed, still return a success marker
+                        return {"status": {"status_str": "success"}}
+
+                # other message types can be logged/debugged
+                else:
+                    # ignore other messages or add debug logging
+                    continue
+
+            # loop finished without receiving completion
+            raise Exception(f"Timeout waiting for ComfyUI completion after {timeout} seconds")
+
+        finally:
             try:
-                # Lấy thông tin progress
-                progress_info = self.get_progress()
-                
-                # Gọi callback nếu có
-                if progress_callback:
-                    progress_callback(progress_info)
-                
-                # Kiểm tra history
-                history = self.get_history(prompt_id)
-                
-                if prompt_id in history:
-                    prompt_data = history[prompt_id]
-                    
-                    if 'status' in prompt_data:
-                        status = prompt_data['status']
-                        
-                        if status.get('status_str') == 'success':
-                            return prompt_data
-                        elif status.get('status_str') == 'error':
-                            error_message = status.get('messages', ['Unknown error'])
-                            raise Exception(f"ComfyUI processing failed: {error_message}")
-                
-                time.sleep(2)  # Đợi 2 giây trước khi kiểm tra lại
-                
+                ws.close()
+            except Exception:
+                pass
+
+
+    def queue_prompt_with_progress(self, prompt: Dict[str, Any], progress_callback=None, timeout: int = 300) -> Dict[str, Any]:
+        """Queue a prompt and listen for progress via WebSocket (preferred).
+
+        If WebSocket isn't available or fails, falls back to queue + HTTP polling.
+        Returns the final prompt history dict on success.
+        """
+        start_time = time.time()
+
+        # If websocket-client not available, fall back
+        if websocket is None:
+            logger.info("websocket-client not installed; falling back to queue + polling")
+            prompt_id = self.queue_prompt(prompt)
+            return self.wait_for_completion_with_progress(prompt_id, progress_callback=progress_callback, timeout=timeout)
+
+        ws_url = f"{self.server_url.rstrip('/')}/ws?clientId={self.client_id}"
+
+        try:
+            ws = websocket.create_connection(ws_url, timeout=5)
+        except Exception as e:
+            logger.warning(f"Failed to open WebSocket ({ws_url}): {e}; falling back to queue + polling")
+            prompt_id = self.queue_prompt(prompt)
+            return self.wait_for_completion_with_progress(prompt_id, progress_callback=progress_callback, timeout=timeout)
+
+        try:
+            # Ensure quick recv timeout for the listen loop
+            try:
+                ws.settimeout(2)
+            except Exception:
+                pass
+
+            # Now send the prompt to the server
+            p = {"prompt": prompt, "client_id": self.client_id}
+            try:
+                resp = requests.post(f"{self.server_url}/prompt", json=p, timeout=self.timeout)
+                resp.raise_for_status()
             except Exception as e:
-                logger.error(f"Error waiting for completion: {str(e)}")
+                logger.error(f"Failed to queue prompt via HTTP after WS opened: {e}")
                 raise
-        
-        raise Exception(f"Timeout waiting for ComfyUI completion after {timeout} seconds")
+
+            try:
+                resp_json = resp.json()
+                prompt_id = resp_json.get('prompt_id')
+            except Exception as e:
+                logger.error(f"Failed to parse prompt response: {e}; text={resp.text}")
+                raise
+
+            logger.info(f"Queued prompt {prompt_id}, listening for progress via WebSocket")
+
+            # Listen for messages until completion or timeout
+            while time.time() - start_time < timeout:
+                try:
+                    raw = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception as e:
+                    logger.warning(f"WebSocket recv error: {e}")
+                    break
+
+                if not raw:
+                    continue
+
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+
+                mtype = msg.get('type')
+
+                if mtype == 'progress':
+                    data = msg.get('data', {})
+                    if progress_callback:
+                        try:
+                            progress_callback(data)
+                        except Exception as cb_e:
+                            logger.warning(f"progress_callback raised: {cb_e}")
+
+                elif mtype == 'executing':
+                    data = msg.get('data', {})
+                    if data.get('prompt_id') == prompt_id and data.get('node') is None:
+                        # Completed
+                        try:
+                            history = self.get_history(prompt_id)
+                            if prompt_id in history:
+                                return history[prompt_id]
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch history after executing WS msg: {e}")
+                        return {"status": {"status_str": "success"}}
+
+                else:
+                    continue
+
+            raise Exception(f"Timeout waiting for prompt {prompt_id} completion after {timeout} seconds")
+
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
     
 
     def process_image_recovery(self, input_image_path: str, prompt: str, 
                              strength: float = 0.8, steps: int = 20, 
-                             guidance_scale: float = 7.5, seed: Optional[int] = None) -> str:
+                             guidance_scale: float = 7.5, seed: Optional[int] = None,
+                             progress_callback=None) -> str:
         """Xử lý phục hồi ảnh với ComfyUI sử dụng Restore.json gốc.
         
         Chỉ thay đổi:
@@ -296,8 +494,7 @@ class ComfyUIClient:
             except Exception as e:
                 logger.warning(f"Failed to upload backup to Firebase: {e}")
 
-            # 2) Clear cache ComfyUI để đảm bảo workflow chạy đầy đủ
-            self.clear_cache()
+            # Cache clear disabled — do not call any system_stats endpoint
 
             # 3) Đọc workflow gốc từ Restore.json (tạo bản copy mới mỗi lần)
             with open("workflows/Restore.json", "r", encoding="utf-8") as f:
@@ -316,11 +513,16 @@ class ComfyUIClient:
             # Debug: Kiểm tra node 75 có đúng không
             logger.info(f"Node 75 inputs: {workflow['75']['inputs']}")
 
-            # 5) Gửi workflow và đợi kết quả
-            prompt_id = self.queue_prompt(workflow)
-            logger.info(f"Queued prompt {prompt_id}, waiting for completion...")
-            result = self.wait_for_completion(prompt_id)
-            logger.info(f"Workflow completed successfully")
+            # 5) Gửi workflow và đợi kết quả (kèm progress qua WebSocket nếu có)
+            try:
+                result = self.queue_prompt_with_progress(workflow, progress_callback=progress_callback)
+                logger.info("Workflow completed successfully (via WS)")
+            except Exception as e:
+                # Fallback: queue + polling
+                logger.warning(f"WS progress flow failed: {e}; falling back to queue + polling")
+                prompt_id = self.queue_prompt(workflow)
+                logger.info(f"Queued prompt {prompt_id}, waiting for completion via polling...")
+                result = self.wait_for_completion(prompt_id)
 
             # 6) Lấy ảnh kết quả
             outputs = result.get("outputs", {}) or {}

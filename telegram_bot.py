@@ -386,12 +386,24 @@ Sẵn sàng xử lý ảnh! 🚀
             logger.info(f"Updated StringFunction node 60 with prompt: {prompt}")
 
             # 5) Gửi workflow và đợi kết quả với progress tracking
-            prompt_id = client.queue_prompt(workflow)
-            logger.info(f"Queued prompt {prompt_id}, waiting for completion...")
-            
-            # Sử dụng method mới với progress callback
-            result = await self._wait_for_completion_with_progress(
-                client, prompt_id, progress_callback
+            # Use ComfyUIClient.queue_prompt_with_progress in a thread so that
+            # the client's WS listener can call a synchronous progress callback.
+            loop = asyncio.get_running_loop()
+
+            def _thread_progress_cb(data):
+                # Adapt sync callback called from background thread to async callback
+                if progress_callback:
+                    try:
+                        asyncio.run_coroutine_threadsafe(progress_callback(data), loop)
+                    except Exception as e:
+                        logger.warning(f"Failed to schedule progress callback: {e}")
+
+            logger.info("Queueing prompt and listening for progress (WS preferred)")
+            # This will run the WS listening logic in a background thread and return final history
+            result = await asyncio.to_thread(
+                client.queue_prompt_with_progress,
+                workflow,
+                _thread_progress_cb
             )
             
             logger.info(f"Workflow completed successfully")
