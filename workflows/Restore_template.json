@@ -1,9 +1,9 @@
 {
   "3": {
     "inputs": {
-      "seed": 60747213359817,
-      "steps": 8,
-      "cfg": 1.5,
+      "seed": "__SEED__",
+      "steps": "__STEPS__",
+      "cfg": "__CFG__",
       "sampler_name": "dpmpp_2s_ancestral_cfg_pp",
       "scheduler": "karras",
       "denoise": 1,
@@ -292,7 +292,7 @@
     },
     "class_type": "ControlNetApplyAdvanced",
     "_meta": {
-      "title": "Apply ControlNet"
+      "title": "ControlNet"
     }
   },
   "33": {
@@ -359,7 +359,7 @@
       "action": "append",
       "tidy_tags": "yes",
       "text_a": "a realistic colored photograph of vietnamese man's portrait",
-      "text_b": "a Vietnamese man wearing a black suit, white shirt, and light gray tie, with neatly combed short hair, looking straight at the camera",
+      "text_b": "__USER_PROMPT__",
       "text_c": ", professtional photography, bright natural ambient light, realistic texture"
     },
     "class_type": "StringFunction|pysssss",
@@ -506,9 +506,9 @@
   },
   "72": {
     "inputs": {
-      "seed": 1119116492091272,
-      "steps": 8,
-      "cfg": 1,
+      "seed": "__SEED_2__",
+      "steps": "__STEPS_2__",
+      "cfg": "__CFG_2__",
       "sampler_name": "euler",
       "scheduler": "normal",
       "denoise": 1,
@@ -564,7 +564,7 @@
   },
   "75": {
     "inputs": {
-      "image": "ảnh phục chế 1.jpg"
+      "image": "__IMAGE_FILENAME__"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -623,7 +623,7 @@
   },
   "80": {
     "inputs": {
-      "guidance": 1.8,
+      "guidance": "__GUIDANCE__",
       "conditioning": [
         "62",
         0

@@ -214,6 +214,13 @@ Sẵn sàng xử lý ảnh! 🚀
         Chỉ thay ảnh đầu vào và text_b của node StringFunction|pysssss."""
         user_id = update.effective_user.id
         try:
+            # Health check ComfyUI trước khi xử lý để báo lỗi sớm
+            comfy = ComfyUIClient()
+            if not comfy.health_check():
+                await update.message.reply_text(
+                    "❌ Không thể kết nối ComfyUI. Hãy kiểm tra cấu hình COMFYUI_SERVER_URL, port 8188, và firewall rồi thử lại.")
+                return
+
             processing_msg = await update.message.reply_text(
                 "Đang xử lý ảnh... Vui lòng chờ trong giây lát...",
                 parse_mode=ParseMode.MARKDOWN
@@ -227,10 +234,12 @@ Sẵn sàng xử lý ảnh! 🚀
                 await file.download_to_drive(local_path)
 
                 client = ComfyUIClient()
-                # Chạy đúng workflow export gốc, chỉ ghi đè filename ảnh và text_b
-                result_filename = client.process_image_recovery_exact(
+                # Sử dụng template system mới với placeholder
+                result_filename = client.process_image_recovery(
                     input_image_path=local_path,
-                    prompt=prompt
+                    prompt=prompt,
+                    steps=8,
+                    guidance_scale=1.8
                 )
 
                 # Tải ảnh kết quả từ ComfyUI
@@ -260,10 +269,18 @@ Sẵn sàng xử lý ảnh! 🚀
 
         except Exception as e:
             logger.error(f"Error processing image recovery: {str(e)}")
-            await update.message.reply_text(
-                f"❌ **Đã xảy ra lỗi:**\n\n{str(e)}\n\nVui lòng thử lại sau.",
-                parse_mode=ParseMode.MARKDOWN
-            )
+            # Phân loại lỗi kết nối ComfyUI để báo rõ ràng
+            msg = str(e)
+            if "Failed to queue prompt" in msg or "Network error queueing prompt" in msg or "Timeout" in msg:
+                friendly = (
+                    "❌ Không thể kết nối ComfyUI.\n\n"
+                    "- Kiểm tra COMFYUI_SERVER_URL (không dùng localhost nếu bot chạy khác máy).\n"
+                    "- Đảm bảo ComfyUI đang chạy và mở port 8188.\n"
+                    "- Kiểm tra firewall hoặc Docker network."
+                )
+            else:
+                friendly = f"❌ Đã xảy ra lỗi: {msg}"
+            await update.message.reply_text(friendly)
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Xử lý callback từ inline keyboard"""

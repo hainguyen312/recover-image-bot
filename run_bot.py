@@ -42,6 +42,21 @@ def check_requirements():
         print("Vui long chay API truoc: python main.py")
         return False
     
+    # Kiểm tra ComfyUI (máy hiện tại)
+    try:
+        import requests
+        comfy_url = f"{config.COMFYUI_SERVER_URL}".rstrip('/') + "/history/0"
+        r = requests.get(comfy_url, timeout=5)
+        if r.status_code == 200:
+            print(f"ComfyUI reachable: {config.COMFYUI_SERVER_URL}")
+        else:
+            print(f"ComfyUI khong phan hoi dung: HTTP {r.status_code}")
+            return False
+    except Exception as e:
+        print(f"Khong the ket noi ComfyUI tai {config.COMFYUI_SERVER_URL}: {e}")
+        print("Vui long dam bao ComfyUI dang chay tren may nay (127.0.0.1:8188)")
+        return False
+    
     print("Tat ca yeu cau da duoc dap ung")
     return True
 

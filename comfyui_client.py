@@ -1,853 +1,503 @@
 import json
-
+import os
 import requests
-
 import time
-
 import websocket
-
 import uuid
-
 import logging
-
 from typing import Dict, Any, Optional
-
 from config import config
-
-
 
 logger = logging.getLogger(__name__)
 
-
-
 class ComfyUIClient:
-
     def __init__(self, server_url: str = None):
-
         self.server_url = server_url or config.COMFYUI_SERVER_URL
-
         self.client_id = config.COMFYUI_CLIENT_ID
+        # Timeout mặc định cho các request (giây)
+        try:
+            self.timeout = int(os.getenv("COMFYUI_TIMEOUT", "15"))
+        except Exception:
+            self.timeout = 15
 
+    def health_check(self) -> bool:
+        """Kiểm tra khả năng kết nối tới ComfyUI server.
+
+        Trả về True nếu kết nối được, False nếu không.
+        """
+        try:
+            # Dùng endpoint nhẹ để kiểm tra (history/0)
+            url = f"{self.server_url}/history/0"
+            response = requests.get(url, timeout=self.timeout)
+            return response.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
         
-
+    def clear_cache(self) -> bool:
+        """Xóa cache ComfyUI để đảm bảo workflow chạy đầy đủ"""
+        try:
+            # Gửi request để clear cache
+            url = f"{self.server_url}/system_stats"
+            response = requests.get(url, timeout=self.timeout)
+            if response.status_code == 200:
+                logger.info("ComfyUI cache cleared")
+                return True
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Could not clear cache: {e}")
+            return False
+        
     def queue_prompt(self, prompt: Dict[str, Any]) -> str:
-
         """Gửi prompt đến ComfyUI và nhận về prompt_id"""
-
         try:
-
             p = {"prompt": prompt, "client_id": self.client_id}
-
-            data = json.dumps(p).encode('utf-8')
-
             
-
             response = requests.post(
-
                 f"{self.server_url}/prompt",
-
-                data=data,
-
-                headers={'Content-Type': 'application/json'}
-
+                json=p,
+                headers={'Content-Type': 'application/json'},
+                timeout=self.timeout
             )
-
             
-
+            logger.info(f"API Response Status: {response.status_code}")
+            logger.info(f"API Response Headers: {response.headers}")
+            logger.info(f"API Response Text: {response.text}")
+            
             if response.status_code == 200:
-
                 result = response.json()
-
                 prompt_id = result['prompt_id']
-
                 logger.info(f"Prompt queued successfully with ID: {prompt_id}")
-
                 return prompt_id
-
             else:
-
-                raise Exception(f"Failed to queue prompt: {response.text}")
-
+                error_msg = f"Failed to queue prompt: HTTP {response.status_code} - {response.text}"
+                logger.error(error_msg)
+                raise Exception(error_msg)
                 
-
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error queueing prompt: {str(e)}")
+            raise
         except Exception as e:
-
             logger.error(f"Error queueing prompt: {str(e)}")
-
             raise
-
     
 
-    def get_image(self, filename: str, subfolder: str = "", folder_type: str = "output") -> bytes:
-
+    def get_image(self, filename: str, subfolder: str = "", folder_type: str = None) -> bytes:
         """Lấy ảnh từ ComfyUI server"""
-
         try:
-
-            data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
-
-            url = f"{self.server_url}/view"
-
+            # Thử tìm trong temp folder trước
+            folder_types = ["temp", "output"] if folder_type is None else [folder_type]
             
-
-            response = requests.get(url, params=data)
-
-            
-
-            if response.status_code == 200:
-
-                return response.content
-
-            else:
-
-                raise Exception(f"Failed to get image: {response.text}")
-
+            for ft in folder_types:
+                data = {"filename": filename, "subfolder": subfolder, "type": ft}
+                url = f"{self.server_url}/view"
                 
-
+                response = requests.get(url, params=data, timeout=self.timeout)
+                
+                if response.status_code == 200:
+                    logger.info(f"Found image in {ft} folder: {filename}")
+                    return response.content
+            
+            raise Exception(f"Failed to get image from any folder: {filename}")
+                
         except Exception as e:
-
             logger.error(f"Error getting image: {str(e)}")
-
             raise
-
     
-
     def get_history(self, prompt_id: str) -> Dict[str, Any]:
-
         """Lấy lịch sử xử lý của prompt"""
-
         try:
-
-            response = requests.get(f"{self.server_url}/history/{prompt_id}")
-
+            response = requests.get(f"{self.server_url}/history/{prompt_id}", timeout=self.timeout)
             
-
             if response.status_code == 200:
-
                 return response.json()
-
             else:
-
                 raise Exception(f"Failed to get history: {response.text}")
-
                 
-
         except Exception as e:
-
             logger.error(f"Error getting history: {str(e)}")
-
             raise
-
     
-
     def wait_for_completion(self, prompt_id: str, timeout: int = 300) -> Dict[str, Any]:
-
         """Đợi cho đến khi xử lý hoàn tất"""
-
         start_time = time.time()
-
         
-
         while time.time() - start_time < timeout:
-
             try:
-
                 history = self.get_history(prompt_id)
-
                 
-
                 if prompt_id in history:
-
                     prompt_data = history[prompt_id]
-
                     
-
                     if 'status' in prompt_data:
-
                         status = prompt_data['status']
-
                         
-
                         if status.get('status_str') == 'success':
-
                             return prompt_data
-
                         elif status.get('status_str') == 'error':
-
                             error_message = status.get('messages', ['Unknown error'])
-
                             raise Exception(f"ComfyUI processing failed: {error_message}")
-
                 
-
                 time.sleep(2)  # Đợi 2 giây trước khi kiểm tra lại
-
                 
-
             except Exception as e:
-
                 logger.error(f"Error waiting for completion: {str(e)}")
-
                 raise
-
         
-
         raise Exception(f"Timeout waiting for ComfyUI completion after {timeout} seconds")
-
     
     def process_image_recovery_exact(self, input_image_path: str, prompt: Optional[str] = None) -> str:
-        """Chạy workflow đúng theo JSON export gốc (workflows/Restore.json),
-        chỉ ghi đè 2 chỗ: filename trong node LoadImage và text_b của node StringFunction|pysssss.
+        """Chạy workflow trực tiếp từ API JSON format (workflows/Restore.json).
+        
+        Chỉ thay đổi các thông số cần thiết:
+        - Node 75 (LoadImage): filename của ảnh input
+        - Node 60 (StringFunction|pysssss): text_b với prompt từ user
 
         Trả về filename ảnh kết quả trên server ComfyUI.
         """
         try:
-            # Import nội bộ để tránh vòng lặp import
-            from run_workflow import (
-                apply_overrides_to_workflow,
-                upload_image,
-                post_prompt,
-                wait_for_completion,
-                select_result_filename,
-            )
-
-            # 1) Đọc workflow export gốc
+            # 1) Đọc workflow API JSON gốc
             workflow_file = "workflows/Restore.json"
             with open(workflow_file, "r", encoding="utf-8") as f:
-                workflow = json.load(f)
+                api_workflow = json.load(f)
 
             # 2) Upload ảnh input lên ComfyUI để có filename trên server
             if not input_image_path:
                 raise Exception("input_image_path is required")
-            image_filename = upload_image(self.server_url, input_image_path)
+            
+            # Upload ảnh lên ComfyUI
+            url = f"{self.server_url.rstrip('/')}/upload/image"
+            filename = os.path.basename(input_image_path)
+            with open(input_image_path, "rb") as f:
+                files = {"image": (filename, f, "application/octet-stream")}
+                response = requests.post(url, files=files)
+                response.raise_for_status()
+            
+            # Kiểm tra response để đảm bảo upload thành công
+            logger.info(f"Upload response status: {response.status_code}")
+            logger.info(f"Upload response text: {response.text}")
+            
+            image_filename = filename
+            logger.info(f"Uploaded image: {image_filename}")
 
-            # 3) Ghi đè đúng 2 chỗ trong workflow
-            workflow = apply_overrides_to_workflow(
-                workflow,
-                image_filename=image_filename,
-                prompt_text=prompt,
-            )
+            # Kiểm tra xem file có tồn tại trên ComfyUI không
+            try:
+                check_url = f"{self.server_url}/view"
+                check_params = {"filename": image_filename, "type": "input"}
+                check_response = requests.get(check_url, params=check_params, timeout=5)
+                if check_response.status_code == 200:
+                    logger.info(f"✅ File {image_filename} exists on ComfyUI server")
+                else:
+                    logger.warning(f"⚠️ File {image_filename} not found on ComfyUI server")
+            except Exception as e:
+                logger.warning(f"Could not verify file existence: {e}")
+
+            # 3) Tạo bản copy và ghi đè parameters cần thiết
+            workflow_copy = json.loads(json.dumps(api_workflow))
+            
+            # Ghi đè filename trong node LoadImage (node 75)
+            if "75" in workflow_copy:
+                workflow_copy["75"]["inputs"]["image"] = image_filename
+                logger.info(f"Updated LoadImage node 75 with filename: {image_filename}")
+            
+            # Ghi đè prompt trong node StringFunction|pysssss (node 60)
+            if "60" in workflow_copy and prompt:
+                workflow_copy["60"]["inputs"]["text_b"] = prompt
+                logger.info(f"Updated StringFunction node 60 with prompt: {prompt}")
 
             # 4) Gửi prompt và đợi hoàn tất
-            prompt_id = post_prompt(self.server_url, workflow)
-            result = wait_for_completion(self.server_url, prompt_id)
+            prompt_id = self.queue_prompt(workflow_copy)
+            result = self.wait_for_completion(prompt_id)
 
-            # 5) Chọn filename ảnh output
-            filename = select_result_filename(result)
-            if not filename:
-                raise Exception("Không tìm thấy ảnh output trong kết quả.")
+            # 5) Chọn filename ảnh output (ưu tiên node 18 RESULT, tránh node 19 ORIGINAL)
+            outputs = result.get("outputs", {}) or {}
+            preferred = None
+            fallback = None
+            any_image = None
+            for node_id, out in outputs.items():
+                if not isinstance(out, dict):
+                    continue
+                images = out.get("images") or []
+                if not images:
+                    continue
+                filename = images[0].get("filename")
+                if not filename:
+                    continue
+                # lưu bất kỳ ảnh nào để fallback cuối cùng
+                if any_image is None:
+                    any_image = (node_id, filename)
+                # ưu tiên node 18
+                if str(node_id) == "18":
+                    preferred = (node_id, filename)
+                # chọn ảnh không phải node 19 làm fallback cấp 1
+                if str(node_id) != "19" and fallback is None:
+                    fallback = (node_id, filename)
 
-            return filename
+            if preferred:
+                logger.info(f"Using RESULT from node {preferred[0]}: {preferred[1]}")
+                return preferred[1]
+            if fallback:
+                logger.info(f"Using non-ORIGINAL image from node {fallback[0]}: {fallback[1]}")
+                return fallback[1]
+            if any_image:
+                logger.info(f"Using first available image from node {any_image[0]}: {any_image[1]}")
+                return any_image[1]
+            
+            raise Exception("Không tìm thấy ảnh output trong kết quả.")
 
         except Exception as e:
             logger.error(f"Error in process_image_recovery_exact: {str(e)}")
             raise
 
+    def create_workflow_template(self, template_file: str = "workflows/Restore_template.json") -> Dict[str, Any]:
+        """Tạo template workflow với placeholder để dễ dàng thay đổi parameters.
+        
+        Args:
+            template_file: Đường dẫn đến file template JSON
+            
+        Returns:
+            Dict chứa workflow template với các placeholder
+        """
+        try:
+            with open(template_file, "r", encoding="utf-8") as f:
+                template = json.load(f)
+            
+            logger.info("Loaded workflow template with placeholders")
+            return template
+            
+        except Exception as e:
+            logger.error(f"Error creating workflow template: {str(e)}")
+            raise
+
+    def apply_template_values(self, template: Dict[str, Any], 
+                            image_filename: str, 
+                            user_prompt: str,
+                            **kwargs) -> Dict[str, Any]:
+        """Áp dụng giá trị thực tế vào template workflow bằng string replacement.
+        
+        Args:
+            template: Template workflow với placeholder
+            image_filename: Tên file ảnh input
+            user_prompt: Prompt từ user
+            **kwargs: Các thông số khác có thể thay đổi (seed, steps, cfg, etc.)
+            
+        Returns:
+            Workflow đã được điền giá trị thực tế
+        """
+        try:
+            # Tạo bản copy để không thay đổi template gốc
+            workflow = json.loads(json.dumps(template))
+            
+            # Tạo mapping các placeholder - chỉ thay thế khi có giá trị mới
+            replacements = {
+                "__IMAGE_FILENAME__": image_filename,
+                "__USER_PROMPT__": user_prompt
+            }
+            
+            # Chỉ thay thế seed nếu được cung cấp
+            if "seed" in kwargs and kwargs["seed"] is not None:
+                replacements["__SEED__"] = str(kwargs["seed"])
+                replacements["__SEED_2__"] = str(kwargs["seed"])
+            
+            # Chỉ thay thế steps nếu được cung cấp
+            if "steps" in kwargs:
+                replacements["__STEPS__"] = str(kwargs["steps"])
+                replacements["__STEPS_2__"] = str(kwargs["steps"])
+            
+            # Chỉ thay thế cfg nếu được cung cấp
+            if "cfg" in kwargs:
+                replacements["__CFG__"] = str(kwargs["cfg"])
+                replacements["__CFG_2__"] = str(kwargs["cfg"])
+            
+            # Chỉ thay thế guidance nếu được cung cấp
+            if "guidance" in kwargs:
+                replacements["__GUIDANCE__"] = str(kwargs["guidance"])
+            
+            # Thực hiện string replacement trên toàn bộ workflow
+            workflow_str = json.dumps(workflow)
+            for placeholder, value in replacements.items():
+                workflow_str = workflow_str.replace(placeholder, value)
+            
+            # Parse lại thành dict
+            workflow = json.loads(workflow_str)
+            
+            # Đặt giá trị mặc định cho các placeholder không được thay thế
+            if "__SEED__" in workflow_str:
+                workflow["3"]["inputs"]["seed"] = 60747213359817
+            if "__SEED_2__" in workflow_str:
+                workflow["72"]["inputs"]["seed"] = 1119116492091272
+            if "__STEPS__" in workflow_str:
+                workflow["3"]["inputs"]["steps"] = 8
+            if "__STEPS_2__" in workflow_str:
+                workflow["72"]["inputs"]["steps"] = 8
+            if "__CFG__" in workflow_str:
+                workflow["3"]["inputs"]["cfg"] = 1.5
+            if "__CFG_2__" in workflow_str:
+                workflow["72"]["inputs"]["cfg"] = 1.0
+            if "__GUIDANCE__" in workflow_str:
+                workflow["80"]["inputs"]["guidance"] = 1.8
+            
+            logger.info(f"Applied template values: image={image_filename}, prompt={user_prompt}")
+            logger.info(f"Applied parameters: {kwargs}")
+            
+            return workflow
+            
+        except Exception as e:
+            logger.error(f"Error applying template values: {str(e)}")
+            raise
 
     def process_image_recovery(self, input_image_path: str, prompt: str, 
-
                              strength: float = 0.8, steps: int = 20, 
-
                              guidance_scale: float = 7.5, seed: Optional[int] = None) -> str:
-
-        """Xử lý phục hồi ảnh với ComfyUI"""
-
+        """Xử lý phục hồi ảnh với ComfyUI sử dụng Restore.json gốc.
+        
+        Chỉ thay đổi:
+        - Node 75 (LoadImage): filename ảnh input
+        - Node 60 (StringFunction|pysssss): text_b prompt
+        
+        Args:
+            input_image_path: Đường dẫn ảnh input
+            prompt: Prompt từ user
+            strength: Không sử dụng (giữ nguyên workflow gốc)
+            steps: Không sử dụng (giữ nguyên workflow gốc)
+            guidance_scale: Không sử dụng (giữ nguyên workflow gốc)
+            seed: Không sử dụng (giữ nguyên workflow gốc)
+            
+        Returns:
+            Tên file ảnh kết quả trên ComfyUI server
+        """
         try:
             logger.info(f"=== PROCESSING IMAGE RECOVERY ===")
             logger.info(f"Input image path: {input_image_path}")
             logger.info(f"User prompt: '{prompt}'")
-            logger.info(f"Strength: {strength}, Steps: {steps}, Guidance: {guidance_scale}, Seed: {seed}")
+            logger.info("Using original Restore.json parameters (no changes to seed, steps, cfg, guidance)")
 
-            # Tạo workflow cho phục hồi ảnh
+            # 1) Upload ảnh lên ComfyUI server với unique filename
+            if not input_image_path:
+                raise Exception("input_image_path is required")
+            
+            # Tạo unique filename để tránh conflict
+            import time
+            import uuid
+            timestamp = int(time.time())
+            unique_id = str(uuid.uuid4())[:8]
+            original_filename = os.path.basename(input_image_path)
+            name, ext = os.path.splitext(original_filename)
+            unique_filename = f"{name}_{timestamp}_{unique_id}{ext}"
+            
+            # Upload lên ComfyUI server
+            url = f"{self.server_url.rstrip('/')}/upload/image"
+            with open(input_image_path, "rb") as f:
+                files = {"image": (unique_filename, f, "application/octet-stream")}
+                response = requests.post(url, files=files)
+                response.raise_for_status()
+            
+            # Kiểm tra response để đảm bảo upload thành công
+            logger.info(f"Upload response status: {response.status_code}")
+            logger.info(f"Upload response text: {response.text}")
+            
+            image_filename = unique_filename
+            logger.info(f"Uploaded image with unique name: {image_filename}")
+            
+            # Kiểm tra xem file có tồn tại trên ComfyUI không
+            try:
+                check_url = f"{self.server_url}/view"
+                check_params = {"filename": image_filename, "type": "input"}
+                check_response = requests.get(check_url, params=check_params, timeout=5)
+                if check_response.status_code == 200:
+                    logger.info(f"✅ File {image_filename} exists on ComfyUI server")
+                else:
+                    logger.warning(f"⚠️ File {image_filename} not found on ComfyUI server")
+            except Exception as e:
+                logger.warning(f"Could not verify file existence: {e}")
+            
+            # 2) Upload backup lên Firebase Storage để lưu trữ
+            try:
+                with open(input_image_path, "rb") as f:
+                    image_bytes = f.read()
+                
+                from storage_service import get_storage_service
+                storage = get_storage_service()
+                
+                # Upload backup với path: input/{unique_filename}
+                firebase_path = f"input/{unique_filename}"
+                import asyncio
+                image_url = asyncio.run(storage.upload_image(
+                    image_bytes, 
+                    firebase_path, 
+                    content_type="image/jpeg"
+                ))
+                
+                logger.info(f"Backup uploaded to Firebase: {firebase_path}")
+                logger.info(f"Firebase URL: {image_url}")
+            except Exception as e:
+                logger.warning(f"Failed to upload backup to Firebase: {e}")
 
-            workflow = self._create_recovery_workflow(
+            # 2) Clear cache ComfyUI để đảm bảo workflow chạy đầy đủ
+            self.clear_cache()
 
-                input_image_path, prompt, strength, steps, guidance_scale, seed
+            # 3) Đọc workflow gốc từ Restore.json (tạo bản copy mới mỗi lần)
+            with open("workflows/Restore.json", "r", encoding="utf-8") as f:
+                workflow = json.loads(f.read())  # Đảm bảo tạo object mới
+            
+            # 4) Chỉ thay đổi 2 thứ: ảnh input và prompt
+            # Lưu filename cũ để debug
+            old_filename = workflow["75"]["inputs"]["image"]
+            workflow["75"]["inputs"]["image"] = image_filename  # Sử dụng ComfyUI filename
+            workflow["60"]["inputs"]["text_b"] = prompt
+            
+            logger.info(f"Updated LoadImage node 75: '{old_filename}' -> '{image_filename}'")
+            logger.info(f"Updated StringFunction node 60 with prompt: {prompt}")
+            logger.info(f"Workflow contains {len(workflow)} nodes")
+            
+            # Debug: Kiểm tra node 75 có đúng không
+            logger.info(f"Node 75 inputs: {workflow['75']['inputs']}")
 
-            )
-
-            logger.info(f"Created workflow with {len(workflow)} nodes")
-
-            # Gửi prompt đến ComfyUI
-
+            # 5) Gửi workflow và đợi kết quả
             prompt_id = self.queue_prompt(workflow)
-
-            
-
-            # Đợi hoàn tất
-
+            logger.info(f"Queued prompt {prompt_id}, waiting for completion...")
             result = self.wait_for_completion(prompt_id)
+            logger.info(f"Workflow completed successfully")
 
+            # 6) Lấy ảnh kết quả
+            outputs = result.get("outputs", {}) or {}
+            preferred = None
+            fallback = None
+            any_image = None
             
-            # Debug: Log structure của result
-            logger.info(f"Result structure: {result}")
+            for node_id, out in outputs.items():
+                if not isinstance(out, dict):
+                    continue
+                images = out.get("images") or []
+                if not images:
+                    continue
+                filename = images[0].get("filename")
+                if not filename:
+                    continue
+                
+                # Lưu ảnh đầu tiên làm fallback
+                if any_image is None:
+                    any_image = (node_id, filename)
+                
+                # Ưu tiên node 18 (RESULT)
+                if str(node_id) == "18":
+                    preferred = (node_id, filename)
+                
+                # Fallback không phải node 19 (ORIGINAL)
+                if str(node_id) != "19" and fallback is None:
+                    fallback = (node_id, filename)
+
+            if preferred:
+                logger.info(f"Using RESULT from node {preferred[0]}: {preferred[1]}")
+                return preferred[1]
+            if fallback:
+                logger.info(f"Using non-ORIGINAL image from node {fallback[0]}: {fallback[1]}")
+                return fallback[1]
+            if any_image:
+                logger.info(f"Using first available image from node {any_image[0]}: {any_image[1]}")
+                return any_image[1]
             
-
-            # Lấy tên file ảnh kết quả
-
-            outputs = result.get('outputs', {})
-
-            logger.info(f"Outputs: {outputs}")
-            
-            # Tìm ảnh trong các output nodes - ưu tiên node 18 (RESULT) trước
-            image_nodes = []
-            for node_id, output_data in outputs.items():
-                logger.info(f"Node {node_id}: {output_data}")
-                if 'images' in output_data:
-                    images = output_data['images']
-                    logger.info(f"Images in node {node_id}: {images}")
-                    if images:
-                        filename = images[0]['filename']
-                        logger.info(f"Found image filename in node {node_id}: {filename}")
-                        try:
-                            nid_int = int(node_id)
-                        except Exception:
-                            nid_int = None
-                        # Bỏ qua node 19 (ORIGINAL IMAGE)
-                        if nid_int == 19:
-                            logger.info("Skipping ORIGINAL IMAGE from node 19")
-                            continue
-                        # Nếu là node 18 (RESULT) thì chọn ngay
-                        if nid_int == 18:
-                            logger.info(f"Selected RESULT image from node 18: {filename}")
-                            return filename
-                        image_nodes.append((nid_int if nid_int is not None else node_id, filename))
-            # Nếu không có node 18, lấy node hợp lệ đầu tiên (đã loại node 19)
-            if image_nodes:
-                final_node_id, final_filename = image_nodes[0]
-                logger.info(f"Selected image from node {final_node_id}: {final_filename}")
-                return final_filename
-
-            
-
-            # Nếu không tìm thấy trong outputs, có thể ảnh được lưu ở chỗ khác
-            logger.error(f"No images found in outputs. Full result: {result}")
-            raise Exception("Không tìm thấy ảnh kết quả trong output")
-
-            
+            raise Exception("Không tìm thấy ảnh output trong kết quả.")
 
         except Exception as e:
-
             logger.error(f"Error processing image recovery: {str(e)}")
-
             raise
-
-    
-
-    def _create_recovery_workflow(self, input_image_path: str, prompt: str,
-
-                                strength: float, steps: int, guidance_scale: float,
-
-                                seed: Optional[int]) -> Dict[str, Any]:
-
-        """Tạo workflow cho phục hồi ảnh"""
-
-        
-
-        # Thử load workflow từ file JSON trước
-
-        workflow_file = "workflows/Restore.json"
-
-        try:
-
-            with open(workflow_file, 'r') as f:
-
-                workflow = json.load(f)
-
-                logger.info(f"Loaded workflow from {workflow_file}")
-
-                
-
-            # Cập nhật parameters trong workflow và convert format
-            converted_workflow = self._update_workflow_parameters(workflow, input_image_path, prompt, 
-                                               strength, steps, guidance_scale, seed)
-
-            return converted_workflow
-        except FileNotFoundError:
-
-            logger.warning(f"Workflow file {workflow_file} not found, using default workflow")
-
-        except Exception as e:
-
-            logger.error(f"Error loading workflow: {e}, using default workflow")
-
-        
-
-        # Fallback: sử dụng workflow mặc định
-
-        fallback_workflow = {
-            "1": {
-
-                "inputs": {
-
-                    "image": input_image_path,
-
-                    "upload": "image"
-
-                },
-
-                "class_type": "LoadImage",
-
-                "_meta": {
-
-                    "title": "Load Image"
-
-                }
-
-            },
-
-            "2": {
-
-                "inputs": {
-
-                    "text": prompt,
-
-                    "clip": ["4", 1]
-
-                },
-
-                "class_type": "CLIPTextEncode",
-
-                "_meta": {
-
-                    "title": "CLIP Text Encode (Prompt)"
-
-                }
-
-            },
-
-            "3": {
-
-                "inputs": {
-
-                    "text": "",
-
-                    "clip": ["4", 1]
-
-                },
-
-                "class_type": "CLIPTextEncode",
-
-                "_meta": {
-
-                    "title": "CLIP Text Encode (Prompt)"
-
-                }
-
-            },
-
-            "4": {
-
-                "inputs": {
-
-                    "ckpt_name": "sd_xl_base_1.0.safetensors"
-
-                },
-
-                "class_type": "CheckpointLoaderSimple",
-
-                "_meta": {
-
-                    "title": "Load Checkpoint"
-
-                }
-
-            },
-
-            "5": {
-
-                "inputs": {
-
-                    "conditioning_1": ["2", 0],
-
-                    "conditioning_2": ["3", 0],
-
-                    "model": ["4", 0],
-
-                    "control_net": ["6", 0],
-
-                    "image": ["1", 0],
-
-                    "strength": strength
-
-                },
-
-                "class_type": "ControlNetApply",
-
-                "_meta": {
-
-                    "title": "Apply ControlNet"
-
-                }
-
-            },
-
-            "6": {
-
-                "inputs": {
-
-                    "control_net_name": "control_v11p_sd15_inpaint.pth"
-
-                },
-
-                "class_type": "ControlNetLoader",
-
-                "_meta": {
-
-                    "title": "Load ControlNet Model"
-
-                }
-
-            },
-
-            "7": {
-
-                "inputs": {
-
-                    "seed": seed if seed is not None else 123456789,
-
-                    "steps": steps,
-
-                    "cfg": guidance_scale,
-
-                    "sampler_name": "euler",
-
-                    "scheduler": "normal",
-
-                    "denoise": 1.0,
-
-                    "model": ["5", 0],
-
-                    "positive": ["2", 0],
-
-                    "negative": ["3", 0],
-
-                    "latent_image": ["8", 0]
-
-                },
-
-                "class_type": "KSampler",
-
-                "_meta": {
-
-                    "title": "KSampler"
-
-                }
-
-            },
-
-            "8": {
-
-                "inputs": {
-
-                    "width": 1024,
-
-                    "height": 1024,
-
-                    "batch_size": 1
-
-                },
-
-                "class_type": "EmptyLatentImage",
-
-                "_meta": {
-
-                    "title": "Empty Latent Image"
-
-                }
-
-            },
-
-            "9": {
-
-                "inputs": {
-
-                    "samples": ["7", 0],
-
-                    "vae": ["4", 2]
-
-                },
-
-                "class_type": "VAEDecode",
-
-                "_meta": {
-
-                    "title": "VAE Decode"
-
-                }
-
-            },
-
-            "10": {
-
-                "inputs": {
-
-                    "filename_prefix": "recovered_image",
-
-                    "images": ["9", 0]
-
-                },
-
-                "class_type": "SaveImage",
-
-                "_meta": {
-
-                    "title": "Save Image"
-
-                }
-
-            }
-
-        }
-
-        
-
-        return fallback_workflow
-    
-
-    def _update_workflow_parameters(self, workflow: Dict[str, Any], input_image_path: str, 
-
-                                   prompt: str, strength: float, steps: int, 
-
-                                   guidance_scale: float, seed: Optional[int]) -> Dict[str, Any]:
-        """Cập nhật parameters trong workflow và convert sang format API"""
-        
-
-        # Xử lý format workflow thực tế của ComfyUI
-
-        if "nodes" in workflow:
-
-            # Format mới: {"nodes": [...], "links": [...]} - cần convert sang format cũ
-            converted_workflow = {}
-            
-            for node in workflow["nodes"]:
-
-                node_id = str(node.get("id", ""))
-                node_type = node.get("type", "")
-
-                
-
-                # Convert sang format cũ cho API
-                converted_node = {
-                    "class_type": node_type,
-                    "inputs": {},
-                    "_meta": {"title": node_type}
-                }
-                
-                # Cập nhật parameters đặc biệt
-                if node_type == "LoadImage":
-
-                    # Cập nhật đường dẫn ảnh input
-
-                    converted_node["inputs"]["image"] = input_image_path
-                    
-
-                elif node_type == "CLIPTextEncode":
-                    # Giữ nguyên TẤT CẢ CLIPTextEncode nodes như trong workflow
-                    if "widgets_values" in node and len(node["widgets_values"]) > 0:
-                        current_text = node["widgets_values"][0]
-                        logger.info(f"CLIPTextEncode node {node_id}: KEEPING ORIGINAL = '{current_text[:100]}...'")
-                        converted_node["inputs"]["text"] = current_text
-                
-                elif node_type == "StringFunction|pysssss":
-                    # Cập nhật text_b (user prompt) trong node 60, giữ nguyên text_a và text_c
-                    if "widgets_values" in node and len(node["widgets_values"]) >= 5:
-                        widgets = node["widgets_values"]
-                        logger.info(f"StringFunction node {node_id}: widgets = {widgets}")
-                        logger.info(f"StringFunction node {node_id}: USER INPUT - Setting text_b = '{prompt}'")
-                        logger.info(f"StringFunction node {node_id}: KEEPING ORIGINAL - text_a = '{widgets[2]}', text_c = '{widgets[4]}'")
-                        converted_node["inputs"]["action"] = widgets[0]      # "append"
-                        converted_node["inputs"]["tidy_tags"] = widgets[1]  # "yes" 
-                        converted_node["inputs"]["text_a"] = widgets[2]     # KEEP ORIGINAL
-                        converted_node["inputs"]["text_b"] = prompt         # USER PROMPT
-                        converted_node["inputs"]["text_c"] = widgets[4]     # KEEP ORIGINAL
-                    
-
-                elif node_type == "KSampler":
-
-                    # Giữ nguyên tham số mặc định trong workflow (không chỉnh sửa tại đây)
-                    pass
-
-                elif "ControlNetApply" in node_type:
-
-                    # Giữ nguyên strength/start/end mặc định trong workflow (không chỉnh sửa tại đây)
-                    pass
-                
-                # Thêm các inputs khác từ widgets_values
-                if "widgets_values" in node and node["widgets_values"]:
-                    widgets = node["widgets_values"]
-                    
-                    # Xử lý các widget inputs dựa trên node type
-                    if node_type == "SetUnionControlNetType":
-                        if len(widgets) >= 1:
-                            logger.info(f"SetUnionControlNetType node {node_id}: Setting type = '{widgets[0]}'")
-                            converted_node["inputs"]["type"] = widgets[0]
-                    
-                    elif node_type == "ControlNetLoader":
-                        if len(widgets) >= 1:
-                            logger.info(f"ControlNetLoader node {node_id}: Setting control_net_name = '{widgets[0]}'")
-                            converted_node["inputs"]["control_net_name"] = widgets[0]
-                    
-                    elif node_type == "CheckpointLoaderSimple":
-                        if len(widgets) >= 1:
-                            logger.info(f"CheckpointLoaderSimple node {node_id}: Setting ckpt_name = '{widgets[0]}'")
-                            converted_node["inputs"]["ckpt_name"] = widgets[0]
-                    
-                    elif node_type == "VAELoader":
-                        if len(widgets) >= 1:
-                            logger.info(f"VAELoader node {node_id}: Setting vae_name = '{widgets[0]}'")
-                            converted_node["inputs"]["vae_name"] = widgets[0]
-                    
-                    elif node_type == "EmptyLatentImage":
-                        if len(widgets) >= 3:
-                            converted_node["inputs"]["width"] = widgets[0]
-                            converted_node["inputs"]["height"] = widgets[1]
-                            converted_node["inputs"]["batch_size"] = widgets[2]
-                    
-                    elif node_type == "ImageScaleToTotalPixels":
-                        if len(widgets) >= 2:
-                            converted_node["inputs"]["upscale_method"] = widgets[0]
-                            converted_node["inputs"]["megapixels"] = widgets[1]
-                    
-                    elif "ControlNetApply" in node_type:
-                        if len(widgets) >= 3:
-                            converted_node["inputs"]["start_percent"] = widgets[1]
-                            converted_node["inputs"]["end_percent"] = widgets[2]
-                    
-                    elif node_type == "LoraLoader":
-                        if len(widgets) >= 3:
-                            logger.info(f"LoraLoader node {node_id}: Setting lora_name = '{widgets[0]}', strength_model = {widgets[1]}, strength_clip = {widgets[2]}")
-                            converted_node["inputs"]["lora_name"] = widgets[0]
-                            converted_node["inputs"]["strength_model"] = widgets[1]
-                            converted_node["inputs"]["strength_clip"] = widgets[2]
-                    
-                    elif node_type == "easy imageSizeByLongerSide":
-                        if len(widgets) >= 1:
-                            converted_node["inputs"]["resolution"] = widgets[0]
-                    
-                    elif node_type == "easy float":
-                        if len(widgets) >= 1:
-                            logger.info(f"easy float node {node_id}: USING DEFAULT value={widgets[0]}")
-                            converted_node["inputs"]["value"] = widgets[0]
-                    
-                    elif node_type == "LayerFilter: GaussianBlurV2":
-                        if len(widgets) >= 1:
-                            logger.info(f"GaussianBlurV2 node {node_id}: USING DEFAULT blur={widgets[0]}")
-                            converted_node["inputs"]["blur"] = widgets[0]
-                    
-                    elif node_type == "LayerFilter: AddGrain":
-                        if len(widgets) >= 3:
-                            logger.info(f"AddGrain node {node_id}: USING DEFAULTS power={widgets[0]}, scale={widgets[1]}, sat={widgets[2]}")
-                            converted_node["inputs"]["grain_power"] = widgets[0]
-                            converted_node["inputs"]["grain_scale"] = widgets[1]
-                            converted_node["inputs"]["grain_sat"] = widgets[2]
-                    
-                    elif node_type == "FluxGuidance":
-                        if len(widgets) >= 1:
-                            logger.info(f"FluxGuidance node {node_id}: USING DEFAULT guidance={widgets[0]}")
-                            converted_node["inputs"]["guidance"] = widgets[0]
-                    
-                    elif node_type == "ImageQuantize":
-                        if len(widgets) >= 2:
-                            converted_node["inputs"]["colors"] = widgets[0]
-                            converted_node["inputs"]["dither"] = widgets[1]
-                    
-                    elif node_type == "LineArtPreprocessor":
-                        if len(widgets) >= 2:
-                            converted_node["inputs"]["coarse"] = widgets[0]
-                            converted_node["inputs"]["resolution"] = widgets[1]
-                    
-                    elif node_type == "DepthAnythingV2Preprocessor":
-                        if len(widgets) >= 2:
-                            converted_node["inputs"]["ckpt_name"] = widgets[0]
-                            converted_node["inputs"]["resolution"] = widgets[1]
-                    
-                    elif node_type == "LoraLoader":
-                        if len(widgets) >= 5:
-                            logger.info(f"LoraLoader node {node_id}: USING DEFAULTS lora={widgets[0]}, sm={widgets[1]}, sc={widgets[2]}")
-                            converted_node["inputs"]["lora_name"] = widgets[0]
-                            converted_node["inputs"]["strength_model"] = widgets[1]
-                            converted_node["inputs"]["strength_clip"] = widgets[2]
-                    
-                    elif node_type == "NunchakuTextEncoderLoaderV2":
-                        if len(widgets) >= 4:
-                            logger.info(f"NunchakuTextEncoderLoaderV2 node {node_id}: Setting model_type = '{widgets[0]}', text_encoder1 = '{widgets[1]}', text_encoder2 = '{widgets[2]}', t5_min_length = {widgets[3]}")
-                            converted_node["inputs"]["model_type"] = widgets[0]
-                            converted_node["inputs"]["text_encoder1"] = widgets[1]
-                            converted_node["inputs"]["text_encoder2"] = widgets[2]
-                            converted_node["inputs"]["t5_min_length"] = widgets[3]
-                    
-                    elif node_type == "UNETLoader":
-                        if len(widgets) >= 2:
-                            logger.info(f"UNETLoader node {node_id}: USING DEFAULTS unet={widgets[0]}, dtype={widgets[1]}")
-                            converted_node["inputs"]["unet_name"] = widgets[0]
-                            converted_node["inputs"]["weight_dtype"] = widgets[1]
-                
-                # Thêm các inputs khác từ links
-                converted_workflow[node_id] = converted_node
-            
-            # Xử lý links để thêm connections
-            if "links" in workflow:
-                for link in workflow["links"]:
-                    if len(link) >= 6:
-                        source_node_id = str(link[1])
-                        source_slot = link[2]
-                        target_node_id = str(link[3])
-                        target_slot = link[4]
-                        link_type = link[5]
-                        
-                        if target_node_id in converted_workflow:
-                            # Tìm tên input thực tế từ target node
-                            target_node = next((n for n in workflow["nodes"] if str(n["id"]) == target_node_id), None)
-                            if target_node and "inputs" in target_node and target_slot < len(target_node["inputs"]):
-                                input_name = target_node["inputs"][target_slot]["name"]
-                                converted_workflow[target_node_id]["inputs"][input_name] = [source_node_id, source_slot]
-            
-            return converted_workflow
-        else:
-
-            # Format cũ: {"1": {...}, "2": {...}} - đã đúng format rồi
-            for node_id, node_data in workflow.items():
-
-                if node_data.get("class_type") == "LoadImage":
-
-                    # Cập nhật đường dẫn ảnh input
-
-                    node_data["inputs"]["image"] = input_image_path
-
-                
-
-                elif node_data.get("class_type") == "CLIPTextEncode":
-
-                    # Giữ nguyên prompt mặc định trong workflow
-                    pass
-                
-
-                elif node_data.get("class_type") == "KSampler":
-
-                    # Giữ nguyên thông số sampler mặc định
-                    pass
-                
-
-                elif node_data.get("class_type") == "ControlNetApply":
-
-                    # Giữ nguyên strength mặc định
-                    pass
-                
-                elif node_type == "VAEDecode":
-                    # Giữ nguyên mặc định; mọi kết nối sẽ được map từ links phía dưới
-                    logger.info(f"VAEDecode node {node_id}: KEEPING DEFAULTS (no widget values)")
-                    pass
-
-                elif node_type == "VAEEncode":
-                    # Giữ nguyên mặc định; mọi kết nối sẽ được map từ links phía dưới
-                    logger.info(f"VAEEncode node {node_id}: KEEPING DEFAULTS (no widget values)")
-                    pass
-
-                elif node_type == "VAELoader":
-                    # Đã có xử lý lấy vae_name từ widgets_values ở phần dưới; không sửa gì thêm
-                    logger.info(f"VAELoader node {node_id}: USING DEFAULTS FROM WORKFLOW")
-                    pass
-            
-            return workflow
-
