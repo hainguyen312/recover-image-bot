@@ -2,12 +2,13 @@ import os
 import logging
 import asyncio
 import tempfile
+import requests
+import json
 from typing import Dict, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 import httpx
-import json
 from io import BytesIO
 from PIL import Image
 
@@ -23,9 +24,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class TelegramBot:
-    def __init__(self, token: str, api_base_url: str = "http://localhost:8000"):
+    def __init__(self, token: str):
         self.token = token
-        self.api_base_url = api_base_url
         self.application = None
         self.user_sessions = {}  # Lưu trữ session của người dùng
         # Khởi tạo storage service (Firebase nếu có, fallback Local)
@@ -137,7 +137,7 @@ Sử dụng các nút bên dưới để thay đổi:
         """Kiểm tra trạng thái API"""
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(f"{self.api_base_url}/health", timeout=10)
+                response = await client.get("http://localhost:8000/health", timeout=10)
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -178,9 +178,9 @@ Sẵn sàng xử lý ảnh! 🚀
         logger.info(f"User {user_id} session updated: {self.user_sessions[user_id]}")
         
         await update.message.reply_text(
-            "Anh da duoc nhan!\n\n"
-            "Bay gio hay gui mo ta ve viec phuc hoi anh (prompt):\n\n"
-            "Vi du: \"restore this damaged photo, fix scratches, improve colors\""
+            "📸 Ảnh đã được nhận!\n\n"
+            "Bây giờ hãy nhập mô tả chi tiết về việc phục hồi ảnh (prompt):\n\n"
+            "Ví dụ: \"restore this damaged photo, fix scratches, improve colors\""
         )
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -201,18 +201,20 @@ Sẵn sàng xử lý ảnh! 🚀
         # Xử lý các lệnh khác
         if text.startswith('/'):
             await update.message.reply_text(
-                "Lenh khong duoc nhan dien. Su dung /help de xem danh sach lenh."
+                "Lệnh không được nhận diện. Sử dụng /help để xem danh sách lệnh."
             )
         else:
             logger.info(f"User {user_id} sent unrecognized text, no session or not waiting for prompt")
             await update.message.reply_text(
-                "Toi khong hieu. Hay gui anh de bat dau phuc hoi hoac su dung /help de xem huong dan."
+                "Tôi không hiểu. Vui lòng gửi ảnh để bắt đầu phục hồi hoặc sử dụng /help để xem hướng dẫn."
             )
     
     async def process_image_recovery(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
         """Xử lý phục hồi ảnh trực tiếp với ComfyUI bằng workflow Restore.json.
         Chỉ thay ảnh đầu vào và text_b của node StringFunction|pysssss."""
         user_id = update.effective_user.id
+        processing_msg = None
+        
         try:
             # Health check ComfyUI trước khi xử lý để báo lỗi sớm
             comfy = ComfyUIClient()
@@ -222,7 +224,7 @@ Sẵn sàng xử lý ảnh! 🚀
                 return
 
             processing_msg = await update.message.reply_text(
-                "Đang xử lý ảnh... Vui lòng chờ trong giây lát...",
+                "🔄 Đang xử lý ảnh... Vui lòng chờ trong giây lát...",
                 parse_mode=ParseMode.MARKDOWN
             )
 
@@ -234,18 +236,71 @@ Sẵn sàng xử lý ảnh! 🚀
                 await file.download_to_drive(local_path)
 
                 client = ComfyUIClient()
-                # Sử dụng template system mới với placeholder
-                result_filename = client.process_image_recovery(
-                    input_image_path=local_path,
-                    prompt=prompt,
-                    steps=8,
-                    guidance_scale=1.8
+                
+                # Lấy thông tin queue trước khi bắt đầu
+                try:
+                    queue_info = client.get_queue_status()
+                    queue_pending = queue_info.get('queue_pending', [])
+                    queue_running = queue_info.get('queue_running', [])
+                    
+                    if queue_pending or queue_running:
+                        queue_text = f"📊 **Queue Status:**\n"
+                        if queue_running:
+                            queue_text += f"🔄 Đang chạy: {len(queue_running)} task(s)\n"
+                        if queue_pending:
+                            queue_text += f"⏳ Đang chờ: {len(queue_pending)} task(s)\n"
+                        
+                        await processing_msg.edit_text(
+                            f"🔄 Đang xử lý ảnh...\n\n{queue_text}\n⏱️ Vui lòng chờ...",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                except Exception as e:
+                    logger.warning(f"Could not get queue info: {e}")
+                
+                # Định nghĩa progress callback để cập nhật tin nhắn
+                async def progress_callback(progress_info):
+                    try:
+                        if not processing_msg:
+                            return
+                            
+                        # Lấy thông tin progress
+                        current_step = progress_info.get('value', 0)
+                        max_steps = progress_info.get('max', 1)
+                        node_name = progress_info.get('node', 'Unknown')
+                        
+                        # Tính phần trăm
+                        if max_steps > 0:
+                            percentage = int((current_step / max_steps) * 100)
+                        else:
+                            percentage = 0
+                        
+                        # Tạo progress bar
+                        progress_bar = "█" * (percentage // 10) + "░" * (10 - percentage // 10)
+                        
+                        # Cập nhật tin nhắn với progress
+                        progress_text = f"🔄 **Đang xử lý ảnh...**\n\n"
+                        progress_text += f"📊 **Progress:** {progress_bar} {percentage}%\n"
+                        progress_text += f"🎯 **Node:** {node_name}\n"
+                        progress_text += f"⏱️ **Step:** {current_step}/{max_steps}\n\n"
+                        progress_text += f"⏳ Vui lòng chờ..."
+                        
+                        await processing_msg.edit_text(
+                            progress_text,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not update progress: {e}")
+                
+                # Sử dụng method mới với progress callback
+                result_filename = await self._process_with_progress(
+                    client, local_path, prompt, progress_callback
                 )
 
                 # Tải ảnh kết quả từ ComfyUI
                 img_bytes = client.get_image(result_filename)
 
-            await processing_msg.delete()
+            if processing_msg:
+                await processing_msg.delete()
 
             # Upload ảnh kết quả lên storage để lấy URL
             try:
@@ -269,6 +324,14 @@ Sẵn sàng xử lý ảnh! 🚀
 
         except Exception as e:
             logger.error(f"Error processing image recovery: {str(e)}")
+            
+            # Xóa processing message nếu có
+            if processing_msg:
+                try:
+                    await processing_msg.delete()
+                except:
+                    pass
+            
             # Phân loại lỗi kết nối ComfyUI để báo rõ ràng
             msg = str(e)
             if "Failed to queue prompt" in msg or "Network error queueing prompt" in msg or "Timeout" in msg:
@@ -281,6 +344,138 @@ Sẵn sàng xử lý ảnh! 🚀
             else:
                 friendly = f"❌ Đã xảy ra lỗi: {msg}"
             await update.message.reply_text(friendly)
+    
+    async def _process_with_progress(self, client: ComfyUIClient, local_path: str, prompt: str, progress_callback):
+        """Xử lý ảnh với progress tracking"""
+        try:
+            # 1) Upload ảnh lên ComfyUI server với unique filename
+            if not local_path:
+                raise Exception("input_image_path is required")
+            
+            # Tạo unique filename để tránh conflict
+            import time
+            import uuid
+            timestamp = int(time.time())
+            unique_id = str(uuid.uuid4())[:8]
+            original_filename = os.path.basename(local_path)
+            name, ext = os.path.splitext(original_filename)
+            unique_filename = f"{name}_{timestamp}_{unique_id}{ext}"
+            
+            # Upload lên ComfyUI server
+            url = f"{client.server_url.rstrip('/')}/upload/image"
+            with open(local_path, "rb") as f:
+                files = {"image": (unique_filename, f, "application/octet-stream")}
+                response = requests.post(url, files=files)
+                response.raise_for_status()
+            
+            image_filename = unique_filename
+            logger.info(f"Uploaded image with unique name: {image_filename}")
+            
+            # 2) Clear cache ComfyUI để đảm bảo workflow chạy đầy đủ
+            client.clear_cache()
+
+            # 3) Đọc workflow gốc từ Restore.json
+            with open("workflows/Restore.json", "r", encoding="utf-8") as f:
+                workflow = json.loads(f.read())
+            
+            # 4) Chỉ thay đổi 2 thứ: ảnh input và prompt
+            workflow["75"]["inputs"]["image"] = image_filename
+            workflow["60"]["inputs"]["text_b"] = prompt
+            
+            logger.info(f"Updated LoadImage node 75: '{image_filename}'")
+            logger.info(f"Updated StringFunction node 60 with prompt: {prompt}")
+
+            # 5) Gửi workflow và đợi kết quả với progress tracking
+            prompt_id = client.queue_prompt(workflow)
+            logger.info(f"Queued prompt {prompt_id}, waiting for completion...")
+            
+            # Sử dụng method mới với progress callback
+            result = await self._wait_for_completion_with_progress(
+                client, prompt_id, progress_callback
+            )
+            
+            logger.info(f"Workflow completed successfully")
+
+            # 6) Lấy ảnh kết quả
+            outputs = result.get("outputs", {}) or {}
+            preferred = None
+            fallback = None
+            any_image = None
+            
+            for node_id, out in outputs.items():
+                if not isinstance(out, dict):
+                    continue
+                images = out.get("images") or []
+                if not images:
+                    continue
+                filename = images[0].get("filename")
+                if not filename:
+                    continue
+                
+                # Lưu ảnh đầu tiên làm fallback
+                if any_image is None:
+                    any_image = (node_id, filename)
+                
+                # Ưu tiên node 18 (RESULT)
+                if str(node_id) == "18":
+                    preferred = (node_id, filename)
+                
+                # Fallback không phải node 19 (ORIGINAL)
+                if str(node_id) != "19" and fallback is None:
+                    fallback = (node_id, filename)
+
+            if preferred:
+                logger.info(f"Using RESULT from node {preferred[0]}: {preferred[1]}")
+                return preferred[1]
+            if fallback:
+                logger.info(f"Using non-ORIGINAL image from node {fallback[0]}: {fallback[1]}")
+                return fallback[1]
+            if any_image:
+                logger.info(f"Using first available image from node {any_image[0]}: {any_image[1]}")
+                return any_image[1]
+            
+            raise Exception("Không tìm thấy ảnh output trong kết quả.")
+
+        except Exception as e:
+            logger.error(f"Error processing image recovery: {str(e)}")
+            raise
+    
+    async def _wait_for_completion_with_progress(self, client: ComfyUIClient, prompt_id: str, progress_callback, timeout: int = 300):
+        """Đợi cho đến khi xử lý hoàn tất với progress tracking"""
+        import time
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                # Lấy thông tin progress
+                progress_info = client.get_progress()
+                
+                # Gọi callback nếu có
+                if progress_callback:
+                    await progress_callback(progress_info)
+                
+                # Kiểm tra history
+                history = client.get_history(prompt_id)
+                
+                if prompt_id in history:
+                    prompt_data = history[prompt_id]
+                    
+                    if 'status' in prompt_data:
+                        status = prompt_data['status']
+                        
+                        if status.get('status_str') == 'success':
+                            return prompt_data
+                        elif status.get('status_str') == 'error':
+                            error_message = status.get('messages', ['Unknown error'])
+                            raise Exception(f"ComfyUI processing failed: {error_message}")
+                
+                await asyncio.sleep(2)  # Đợi 2 giây trước khi kiểm tra lại
+                
+            except Exception as e:
+                logger.error(f"Error waiting for completion: {str(e)}")
+                raise
+        
+        raise Exception(f"Timeout waiting for ComfyUI completion after {timeout} seconds")
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Xử lý callback từ inline keyboard"""
@@ -337,9 +532,7 @@ async def main():
         logger.error("TELEGRAM_BOT_TOKEN environment variable is not set!")
         return
     
-    api_url = os.getenv('API_BASE_URL', 'http://localhost:8000')
-    
-    bot = TelegramBot(bot_token, api_url)
+    bot = TelegramBot(bot_token)
     await bot.run()
 
 if __name__ == "__main__":
