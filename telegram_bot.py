@@ -816,43 +816,72 @@ Sẵn sàng xử lý ảnh! 🚀
                 friendly = f"❌ Đã xảy ra lỗi: {msg}"
             await update.message.reply_text(friendly)
 
-    def _build_inpainting_workflow(self, main_path: str, prompt: str, ref_paths: list) -> dict:
-        """Xây dựng dict workflow Inpainting.json với ảnh đã upload vào ComfyUI.
-        Lưu ý: Việc upload ảnh chính/refs sẽ được thực hiện bên trong ComfyUIClient.process_inpainting,
-        nhưng ở đây ta dùng cơ chế queue_prompt_with_progress trực tiếp nên cần nạp JSON và thay filename
-        sau khi upload. Đơn giản hóa: ta sẽ dùng chính logic từ process_inpainting nhưng inline.
-        """
-        # Thay vì gọi trực tiếp process_inpainting (vì ta muốn nghe progress từ queue_prompt_with_progress),
-        # ta upload hình ở đây và thay vào JSON rồi trả về dict prompt.
-        client = ComfyUIClient()
-        # Upload ảnh
-        def _upload(local_path: str) -> str:
-            timestamp = int(time.time())
-            uid = uuid.uuid4().hex[:8]
-            base, ext = os.path.splitext(os.path.basename(local_path))
-            unique = f"{base}_{timestamp}_{uid}{ext}"
-            url = f"{client.server_url.rstrip('/')}/upload/image"
-            with open(local_path, 'rb') as f:
-                files = {"image": (unique, f, "application/octet-stream")}
-                r = requests.post(url, files=files)
-                r.raise_for_status()
-            return unique
+def _build_inpainting_workflow(self, main_path: str, prompt: str, ref_paths: list) -> dict:
+    """Xây dựng dict workflow Inpainting.json với ảnh đã upload vào ComfyUI."""
+    import time
+    import uuid
+    import os
+    
+    client = ComfyUIClient()
+    
+    # Upload ảnh
+    def _upload(local_path: str) -> str:
+        timestamp = int(time.time())
+        uid = uuid.uuid4().hex[:8]
+        base, ext = os.path.splitext(os.path.basename(local_path))
+        unique = f"{base}_{timestamp}_{uid}{ext}"
+        url = f"{client.server_url.rstrip('/')}/upload/image"
+        with open(local_path, 'rb') as f:
+            files = {"image": (unique, f, "application/octet-stream")}
+            r = requests.post(url, files=files)
+            r.raise_for_status()
+        return unique
 
-        img1 = _upload(main_path)
-        img2 = _upload(ref_paths[0]) if len(ref_paths) > 0 else None
-        img3 = _upload(ref_paths[1]) if len(ref_paths) > 1 else None
+    # Upload ảnh chính và refs
+    img1 = _upload(main_path)
+    img2 = _upload(ref_paths[0]) if len(ref_paths) > 0 else None
+    img3 = _upload(ref_paths[1]) if len(ref_paths) > 1 else None
 
-        with open("workflows/Inpainting.json", "r", encoding="utf-8") as f:
-            wf = json.loads(f.read())
-        if "78" in wf and "inputs" in wf["78"]:
-            wf["78"]["inputs"]["image"] = img1
-        if img2 and "106" in wf and "inputs" in wf["106"]:
-            wf["106"]["inputs"]["image"] = img2
-        if img3 and "108" in wf and "inputs" in wf["108"]:
-            wf["108"]["inputs"]["image"] = img3
-        if "111" in wf and "inputs" in wf["111"]:
-            wf["111"]["inputs"]["prompt"] = prompt
-        return wf
+    logger.info(f"Uploaded images: img1={img1}, img2={img2}, img3={img3}")
+
+    # Đọc workflow template
+    with open("workflows/Inpainting.json", "r", encoding="utf-8") as f:
+        wf = json.loads(f.read())
+    
+    # Node 78: ảnh chính (bắt buộc)
+    if "78" in wf and "inputs" in wf["78"]:
+        wf["78"]["inputs"]["image"] = img1
+    
+    # Node 106: ref image 2 (tùy chọn)
+    if img2 and "106" in wf and "inputs" in wf["106"]:
+        wf["106"]["inputs"]["image"] = img2
+    
+    # Node 108: ref image 3 (tùy chọn)
+    if img3 and "108" in wf and "inputs" in wf["108"]:
+        wf["108"]["inputs"]["image"] = img3
+    
+    # Node 111: TextEncodeQwenImageEditPlus (positive prompt)
+    if "111" in wf and "inputs" in wf["111"]:
+        wf["111"]["inputs"]["prompt"] = prompt
+        
+        # QUAN TRỌNG: Xóa image2/image3 nếu không có
+        if not img2 and "image2" in wf["111"]["inputs"]:
+            del wf["111"]["inputs"]["image2"]
+            logger.info("Removed image2 from node 111 (no ref image 2)")
+        
+        if not img3 and "image3" in wf["111"]["inputs"]:
+            del wf["111"]["inputs"]["image3"]
+            logger.info("Removed image3 from node 111 (no ref image 3)")
+    
+    # Node 110: negative prompt (cũng cần xóa nếu không có refs)
+    if "110" in wf and "inputs" in wf["110"]:
+        if not img2 and "image2" in wf["110"]["inputs"]:
+            del wf["110"]["inputs"]["image2"]
+        if not img3 and "image3" in wf["110"]["inputs"]:
+            del wf["110"]["inputs"]["image3"]
+    
+    logger.info(f"Built inpainting workflow with {len(wf)} nodes")
+    return wf
 
 async def main():
     """Main function"""
