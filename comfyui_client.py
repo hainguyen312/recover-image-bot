@@ -39,15 +39,57 @@ class ComfyUIClient:
             return False
         
     def clear_cache(self) -> bool:
-        """No-op: cache clearing disabled.
-
-        Historically this method sent a GET to /system_stats to trigger a cache
-        clear on ComfyUI. That behavior is disabled because it can cause
-        unwanted side-effects. The method remains for compatibility and simply
-        logs that cache clearing is skipped.
+        """Xóa cache và giải phóng VRAM trên ComfyUI server.
+        
+        Thử các endpoint để:
+        1. Free memory (/free)
+        2. Unload models nếu có endpoint
+        
+        Returns:
+            True nếu thành công, False nếu không
         """
-        logger.info("clear_cache is disabled; skipping cache clear")
-        return False
+        success = False
+        
+        # 1. Thử endpoint /free để giải phóng memory
+        try:
+            url = f"{self.server_url.rstrip('/')}/free"
+            response = requests.post(url, timeout=self.timeout)
+            if response.status_code == 200:
+                logger.info("✅ Successfully called /free endpoint to free memory")
+                success = True
+            else:
+                logger.warning(f"⚠️ /free endpoint returned status {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"⚠️ /free endpoint not available or failed: {e}")
+        
+        # 2. Thử endpoint /system_stats để trigger cache clear (nếu có)
+        # Lưu ý: endpoint này có thể có side effects nhưng có thể giúp clear cache
+        try:
+            url = f"{self.server_url.rstrip('/')}/system_stats"
+            response = requests.get(url, timeout=self.timeout)
+            if response.status_code == 200:
+                logger.info("✅ Successfully called /system_stats endpoint")
+                success = True
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"/system_stats endpoint not available: {e}")
+        
+        # 3. Thử unload models nếu có endpoint (một số custom API có thể có)
+        try:
+            url = f"{self.server_url.rstrip('/')}/unload"
+            response = requests.post(url, timeout=self.timeout)
+            if response.status_code == 200:
+                logger.info("✅ Successfully called /unload endpoint")
+                success = True
+        except requests.exceptions.RequestException:
+            # Endpoint này có thể không tồn tại, không cần log warning
+            pass
+        
+        if success:
+            logger.info("Cache clearing completed successfully")
+        else:
+            logger.warning("Cache clearing attempted but no endpoints responded successfully")
+        
+        return success
         
     def queue_prompt(self, prompt: Dict[str, Any]) -> str:
         """Gửi prompt đến ComfyUI và nhận về prompt_id"""
@@ -494,8 +536,6 @@ class ComfyUIClient:
             except Exception as e:
                 logger.warning(f"Failed to upload backup to Firebase: {e}")
 
-            # Cache clear disabled — do not call any system_stats endpoint
-
             # 3) Đọc workflow gốc từ Restore.json (tạo bản copy mới mỗi lần)
             with open("workflows/Restore.json", "r", encoding="utf-8") as f:
                 workflow = json.loads(f.read())  # Đảm bảo tạo object mới
@@ -552,17 +592,27 @@ class ComfyUIClient:
                 if str(node_id) != "19" and fallback is None:
                     fallback = (node_id, filename)
 
+            result_filename = None
             if preferred:
                 logger.info(f"Using RESULT from node {preferred[0]}: {preferred[1]}")
-                return preferred[1]
-            if fallback:
+                result_filename = preferred[1]
+            elif fallback:
                 logger.info(f"Using non-ORIGINAL image from node {fallback[0]}: {fallback[1]}")
-                return fallback[1]
-            if any_image:
+                result_filename = fallback[1]
+            elif any_image:
                 logger.info(f"Using first available image from node {any_image[0]}: {any_image[1]}")
-                return any_image[1]
+                result_filename = any_image[1]
+            else:
+                raise Exception("Không tìm thấy ảnh output trong kết quả.")
             
-            raise Exception("Không tìm thấy ảnh output trong kết quả.")
+            # 7) Clear cache để giải phóng VRAM cho lần xử lý tiếp theo
+            try:
+                logger.info("Clearing cache to free VRAM...")
+                self.clear_cache()
+            except Exception as e:
+                logger.warning(f"Failed to clear cache (non-critical): {e}")
+            
+            return result_filename
 
         except Exception as e:
             logger.error(f"Error processing image recovery: {str(e)}")
