@@ -30,6 +30,14 @@ class TelegramBot:
         self.user_sessions = {}  # Lưu trữ session của người dùng
         # Khởi tạo storage service (Firebase nếu có, fallback Local)
         self.storage = get_storage_service()
+        # Trạng thái luồng inpainting
+        # user_sessions[user_id] sẽ có các khóa:
+        #  - waiting_for_prompt: bool
+        #  - photo_file_id: str
+        #  - workflow_prompt: str
+        #  - awaiting_ref_choice: bool
+        #  - waiting_for_ref_images: bool
+        #  - ref_file_ids: list[str]
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Xử lý lệnh /start"""
@@ -192,11 +200,40 @@ Sẵn sàng xử lý ảnh! 🚀
         logger.info(f"User {user_id} sent text: '{text}'")
         logger.info(f"User session: {self.user_sessions.get(user_id, 'No session')}")
         
-        # Kiểm tra nếu user đang nhập prompt
+        # Người dùng đang ở bước nhập prompt -> phân loại workflow tự động
         if user_id in self.user_sessions and self.user_sessions[user_id].get('waiting_for_prompt'):
-            logger.info(f"Processing prompt for user {user_id}: '{text}'")
-            await self.process_image_recovery(update, context, text)
+            logger.info(f"Classifying prompt for user {user_id}: '{text}'")
+            # Lưu prompt vào session
+            self.user_sessions[user_id]['workflow_prompt'] = text
+
+            selected = self.classify_workflow(text)
+            self.user_sessions[user_id]['selected_workflow'] = selected
+
+            if selected == 'restore':
+                await self.process_image_recovery(update, context, text)
+                return
+
+            # Inpainting: hỏi người dùng có muốn gửi ảnh tham chiếu
+            self.user_sessions[user_id]['awaiting_ref_choice'] = True
+            keyboard = [
+                [
+                    InlineKeyboardButton("➕ Gửi ảnh tham chiếu", callback_data="inpaint_add_ref"),
+                    InlineKeyboardButton("⏭️ Không cần", callback_data="inpaint_no_ref"),
+                ]
+            ]
+            await update.message.reply_text(
+                "🖌️ Yêu cầu của bạn là chỉnh nội dung (inpainting).\n\n"
+                "Bạn có muốn gửi thêm 1–2 ảnh tham chiếu để kết quả tự nhiên hơn không?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return
+
+        # Nếu đang chờ người dùng gửi ảnh tham chiếu (inpainting)
+        if user_id in self.user_sessions and self.user_sessions[user_id].get('waiting_for_ref_images'):
+            # Người dùng nhắn 'xong' để bắt đầu xử lý
+            if text.lower() in ["xong", "done", "finish"]:
+                await self._start_inpainting_with_refs(update, context)
+                return
         
         # Xử lý các lệnh khác
         if text.startswith('/'):
@@ -504,6 +541,26 @@ Sẵn sàng xử lý ảnh! 🚀
             await self.status_command(update, context)
         elif query.data == "close_settings":
             await query.edit_message_text("✅ Cài đặt đã được lưu!")
+        elif query.data == "inpaint_no_ref":
+            # Bắt đầu inpainting không có ref
+            sess = self.user_sessions.get(user_id, {})
+            prompt = sess.get('workflow_prompt')
+            if not prompt or 'photo_file_id' not in sess:
+                await query.edit_message_text("⚠️ Thiếu ảnh hoặc prompt, vui lòng gửi lại từ đầu.")
+                return
+            await query.edit_message_text("🔄 Bắt đầu xử lý inpainting (không dùng ảnh tham chiếu)...")
+            await self._process_inpainting_flow(update, context, prompt, [])
+        elif query.data == "inpaint_add_ref":
+            # Cho phép người dùng gửi 1–2 ảnh tham chiếu
+            if user_id not in self.user_sessions:
+                self.user_sessions[user_id] = {}
+            self.user_sessions[user_id]['awaiting_ref_choice'] = False
+            self.user_sessions[user_id]['waiting_for_ref_images'] = True
+            self.user_sessions[user_id]['ref_file_ids'] = []
+            await query.edit_message_text(
+                "📎 Hãy gửi 1–2 ảnh tham chiếu (mặc áo, nền, ánh sáng...).\n\n"
+                "Khi xong, hãy nhắn 'xong' để bắt đầu xử lý."
+            )
         # Có thể thêm các callback khác cho settings...
     
     def setup_handlers(self):
@@ -515,7 +572,7 @@ Sẵn sàng xử lý ảnh! 🚀
         self.application.add_handler(CommandHandler("status", self.status_command))
         
         # Message handlers
-        self.application.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
+        self.application.add_handler(MessageHandler(filters.PHOTO, self.handle_photo_or_ref))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
         
         # Callback query handler
@@ -535,6 +592,267 @@ Sẵn sàng xử lý ảnh! 🚀
         
         # Giữ bot chạy
         await asyncio.Event().wait()
+
+    # ====== Phân loại workflow (LLM local + heuristic) ======
+    def _classify_by_keywords(self, text: str) -> str:
+        t = (text or "").lower()
+        inpaint_keys = [
+            "inpaint", "change", "replace", "switch", "background", "remove object", "add object",
+            "đổi", "thay", "thêm", "xóa", "đổi nền", "bãi biển", "beach", "blend", "áo", "quần", "tóc", "ghép", "edit"
+        ]
+        restore_keys = [
+            "restore", "recover", "enhance", "old photo", "fix scratch", "scratch", "stain",
+            "remove noise", "grain", "sharpen", "color", "exposure", "discolor", "blur",
+            "phục hồi", "phục chế", "khử nhiễu", "vết xước", "vết bẩn", "tăng chi tiết", "cân bằng màu"
+        ]
+        inpaint_score = sum(k in t for k in inpaint_keys)
+        restore_score = sum(k in t for k in restore_keys)
+        return 'inpaint' if inpaint_score > restore_score else 'restore'
+
+    def _classify_with_local_llm(self, text: str) -> str:
+        try:
+            ollama_model = os.getenv('OLLAMA_MODEL')
+            if not ollama_model:
+                return self._classify_by_keywords(text)
+            ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434').rstrip('/')
+            url = f"{ollama_url}/api/generate"
+            instruction = (
+                "You are a classifier. Decide the best workflow for an image request. "
+                "Return exactly one token: 'restore' or 'inpaint'.\n\n"
+                "If the user asks to change content (background, clothes, remove/add objects), answer 'inpaint'. "
+                "If the user asks to restore/enhance/fix quality (scratches, noise, colors), answer 'restore'.\n\n"
+                f"User request: {text}\nAnswer:"
+            )
+            payload = {"model": ollama_model, "prompt": instruction, "stream": False}
+            r = requests.post(url, json=payload, timeout=10)
+            r.raise_for_status()
+            resp = (r.json().get('response') or '').strip().lower()
+            if 'inpaint' in resp:
+                return 'inpaint'
+            if 'restore' in resp:
+                return 'restore'
+            return self._classify_by_keywords(text)
+        except Exception:
+            return self._classify_by_keywords(text)
+
+    def classify_workflow(self, text: str) -> str:
+        return self._classify_with_local_llm(text)
+
+    # ====== Nhận ảnh: ảnh chính hoặc ảnh tham chiếu ======
+    async def handle_photo_or_ref(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        photo = update.message.photo[-1]
+        sess = self.user_sessions.get(user_id)
+        if not sess or not sess.get('waiting_for_ref_images'):
+            # Ảnh chính như luồng cũ
+            await self.handle_photo(update, context)
+            return
+        # Đang thu thập ảnh ref
+        ref_ids = sess.setdefault('ref_file_ids', [])
+        if len(ref_ids) >= 2:
+            await update.message.reply_text("Bạn đã gửi đủ 2 ảnh tham chiếu. Nhắn 'xong' để bắt đầu.")
+            return
+        ref_ids.append(photo.file_id)
+        await update.message.reply_text(f"✅ Đã nhận ảnh tham chiếu #{len(ref_ids)}. Gửi thêm hoặc nhắn 'xong'.")
+
+    async def _start_inpainting_with_refs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        sess = self.user_sessions.get(user_id, {})
+        prompt = sess.get('workflow_prompt', '')
+        ref_ids = sess.get('ref_file_ids', [])
+        await update.message.reply_text("🔄 Bắt đầu xử lý inpainting với ảnh tham chiếu...")
+        await self._process_inpainting_flow(update, context, prompt, ref_ids)
+
+    async def _process_inpainting_flow(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, ref_file_ids):
+        user_id = update.effective_user.id
+        processing_msg = None
+        try:
+            comfy = ComfyUIClient()
+            if not comfy.health_check():
+                await update.message.reply_text(
+                    "❌ Không thể kết nối ComfyUI. Hãy kiểm tra cấu hình COMFYUI_SERVER_URL, port 8188, và firewall rồi thử lại.")
+                return
+
+            processing_msg = await update.message.reply_text(
+                "🔄 Đang xử lý inpainting... Vui lòng chờ trong giây lát...",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+            photo_file_id = self.user_sessions[user_id]['photo_file_id']
+            main_file = await context.bot.get_file(photo_file_id)
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                main_path = os.path.join(tmpdir, "input.jpg")
+                await main_file.download_to_drive(main_path)
+
+                ref_paths = []
+                for idx, fid in enumerate(ref_file_ids[:2]):
+                    try:
+                        f = await context.bot.get_file(fid)
+                        ref_path = os.path.join(tmpdir, f"ref_{idx+1}.jpg")
+                        await f.download_to_drive(ref_path)
+                        ref_paths.append(ref_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to download ref image {fid}: {e}")
+
+                client = ComfyUIClient()
+
+                # Hiển thị queue nếu có
+                try:
+                    queue_info = client.get_queue_status()
+                    qp = queue_info.get('queue_pending', [])
+                    qr = queue_info.get('queue_running', [])
+                    if qp or qr:
+                        queue_text = "📊 **Queue Status:**\n"
+                        if qr:
+                            queue_text += f"🔄 Đang chạy: {len(qr)} task(s)\n"
+                        if qp:
+                            queue_text += f"⏳ Đang chờ: {len(qp)} task(s)\n"
+                        await processing_msg.edit_text(
+                            f"🔄 Đang xử lý inpainting...\n\n{queue_text}\n⏱️ Vui lòng chờ...",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                except Exception as e:
+                    logger.warning(f"Could not get queue info: {e}")
+
+                async def progress_callback(progress_info):
+                    try:
+                        if not processing_msg:
+                            return
+                        current_step = progress_info.get('value', 0)
+                        max_steps = progress_info.get('max', 1)
+                        node_name = progress_info.get('node', 'Unknown')
+                        percentage = int((current_step / max_steps) * 100) if max_steps > 0 else 0
+                        progress_bar = "█" * (percentage // 10) + "░" * (10 - percentage // 10)
+                        progress_text = (
+                            f"🔄 **Đang xử lý inpainting...**\n\n"
+                            f"📊 **Progress:** {progress_bar} {percentage}%\n"
+                            f"🎯 **Node:** {node_name}\n"
+                            f"⏱️ **Step:** {current_step}/{max_steps}\n\n"
+                            f"⏳ Vui lòng chờ..."
+                        )
+                        await processing_msg.edit_text(progress_text, parse_mode=ParseMode.MARKDOWN)
+                    except Exception as e:
+                        logger.warning(f"Could not update progress: {e}")
+
+                # Chạy process_inpainting trong thread, có progress
+                loop = asyncio.get_running_loop()
+
+                def _thread_progress_cb(data):
+                    try:
+                        asyncio.run_coroutine_threadsafe(progress_callback(data), loop)
+                    except Exception as e:
+                        logger.warning(f"Failed to schedule progress callback: {e}")
+
+                result = await asyncio.to_thread(
+                    client.queue_prompt_with_progress,
+                    self._build_inpainting_workflow(main_path, prompt, ref_paths),
+                    _thread_progress_cb,
+                )
+
+                # Lấy ảnh kết quả
+                outputs = result.get("outputs", {}) or {}
+                pref = None
+                fb = None
+                any_img = None
+                for node_id, out in outputs.items():
+                    if not isinstance(out, dict):
+                        continue
+                    images = out.get("images") or []
+                    if not images:
+                        continue
+                    filename = images[0].get("filename")
+                    if not filename:
+                        continue
+                    if str(node_id) == "8" and pref is None:
+                        pref = (node_id, filename)
+                    if str(node_id) == "116" and not pref:
+                        pref = (node_id, filename)
+                    if fb is None:
+                        fb = (node_id, filename)
+                    if any_img is None:
+                        any_img = (node_id, filename)
+
+                chosen = pref[1] if pref else (fb[1] if fb else (any_img[1] if any_img else None))
+                if not chosen:
+                    raise Exception("Không tìm thấy ảnh output trong kết quả.")
+
+                img_bytes = client.get_image(chosen)
+
+            if processing_msg:
+                await processing_msg.delete()
+
+            # Upload ảnh kết quả
+            try:
+                public_url = await self.storage.upload_image(img_bytes, chosen, content_type="image/png")
+            except Exception:
+                await update.message.reply_photo(photo=BytesIO(img_bytes), caption=f"🎨 Ảnh đã được chỉnh!")
+            else:
+                await update.message.reply_photo(photo=public_url, caption=f"🎨 Ảnh đã được chỉnh!")
+
+            # Reset session flags
+            self.user_sessions[user_id]['waiting_for_prompt'] = False
+            self.user_sessions[user_id]['awaiting_ref_choice'] = False
+            self.user_sessions[user_id]['waiting_for_ref_images'] = False
+            self.user_sessions[user_id].pop('ref_file_ids', None)
+            self.user_sessions[user_id].pop('workflow_prompt', None)
+
+        except Exception as e:
+            logger.error(f"Error processing inpainting: {str(e)}")
+            if processing_msg:
+                try:
+                    await processing_msg.delete()
+                except:
+                    pass
+            msg = str(e)
+            if "Failed to queue prompt" in msg or "Network error queueing prompt" in msg or "Timeout" in msg:
+                friendly = (
+                    "❌ Không thể kết nối ComfyUI.\n\n"
+                    "- Kiểm tra COMFYUI_SERVER_URL (không dùng localhost nếu bot chạy khác máy).\n"
+                    "- Đảm bảo ComfyUI đang chạy và mở port 8188.\n"
+                    "- Kiểm tra firewall hoặc Docker network."
+                )
+            else:
+                friendly = f"❌ Đã xảy ra lỗi: {msg}"
+            await update.message.reply_text(friendly)
+
+    def _build_inpainting_workflow(self, main_path: str, prompt: str, ref_paths: list) -> dict:
+        """Xây dựng dict workflow Inpainting.json với ảnh đã upload vào ComfyUI.
+        Lưu ý: Việc upload ảnh chính/refs sẽ được thực hiện bên trong ComfyUIClient.process_inpainting,
+        nhưng ở đây ta dùng cơ chế queue_prompt_with_progress trực tiếp nên cần nạp JSON và thay filename
+        sau khi upload. Đơn giản hóa: ta sẽ dùng chính logic từ process_inpainting nhưng inline.
+        """
+        # Thay vì gọi trực tiếp process_inpainting (vì ta muốn nghe progress từ queue_prompt_with_progress),
+        # ta upload hình ở đây và thay vào JSON rồi trả về dict prompt.
+        client = ComfyUIClient()
+        # Upload ảnh
+        def _upload(local_path: str) -> str:
+            timestamp = int(time.time())
+            uid = uuid.uuid4().hex[:8]
+            base, ext = os.path.splitext(os.path.basename(local_path))
+            unique = f"{base}_{timestamp}_{uid}{ext}"
+            url = f"{client.server_url.rstrip('/')}/upload/image"
+            with open(local_path, 'rb') as f:
+                files = {"image": (unique, f, "application/octet-stream")}
+                r = requests.post(url, files=files)
+                r.raise_for_status()
+            return unique
+
+        img1 = _upload(main_path)
+        img2 = _upload(ref_paths[0]) if len(ref_paths) > 0 else None
+        img3 = _upload(ref_paths[1]) if len(ref_paths) > 1 else None
+
+        with open("workflows/Inpainting.json", "r", encoding="utf-8") as f:
+            wf = json.loads(f.read())
+        if "78" in wf and "inputs" in wf["78"]:
+            wf["78"]["inputs"]["image"] = img1
+        if img2 and "106" in wf and "inputs" in wf["106"]:
+            wf["106"]["inputs"]["image"] = img2
+        if img3 and "108" in wf and "inputs" in wf["108"]:
+            wf["108"]["inputs"]["image"] = img3
+        if "111" in wf and "inputs" in wf["111"]:
+            wf["111"]["inputs"]["prompt"] = prompt
+        return wf
 
 async def main():
     """Main function"""

@@ -617,3 +617,129 @@ class ComfyUIClient:
         except Exception as e:
             logger.error(f"Error processing image recovery: {str(e)}")
             raise
+
+    def process_inpainting(self, input_image_path: str, prompt: str,
+                           ref_image2_path: Optional[str] = None,
+                           ref_image3_path: Optional[str] = None,
+                           progress_callback=None) -> str:
+        """Xử lý inpainting với ComfyUI sử dụng workflows/Inpainting.json.
+
+        Thay đổi tối thiểu:
+        - Node "78" (LoadImage): ảnh chính (image)
+        - Node "111" (TextEncodeQwenImageEditPlus): prompt tích cực
+        - Tùy chọn: Node "106" và "108" (LoadImage) nếu cung cấp ref_image2/3
+
+        Args:
+            input_image_path: Ảnh cần inpaint/chỉnh sửa
+            prompt: Mô tả chỉnh sửa
+            ref_image2_path: Ảnh tham chiếu 2 (tùy chọn)
+            ref_image3_path: Ảnh tham chiếu 3 (tùy chọn)
+            progress_callback: Callback đồng bộ nhận dict tiến độ
+
+        Returns:
+            Tên file ảnh kết quả trên ComfyUI server
+        """
+        try:
+            logger.info("=== PROCESSING INPAINTING WORKFLOW ===")
+            logger.info(f"Input image path: {input_image_path}")
+            logger.info(f"User prompt: '{prompt}'")
+
+            if not input_image_path:
+                raise Exception("input_image_path is required")
+
+            # Helper: upload a local image to ComfyUI and return unique filename
+            def _upload_image(local_path: str) -> str:
+                timestamp = int(time.time())
+                uid = uuid.uuid4().hex[:8]
+                base, ext = os.path.splitext(os.path.basename(local_path))
+                unique_name = f"{base}_{timestamp}_{uid}{ext}"
+                url = f"{self.server_url.rstrip('/')}/upload/image"
+                with open(local_path, "rb") as f:
+                    files = {"image": (unique_name, f, "application/octet-stream")}
+                    resp = requests.post(url, files=files)
+                    resp.raise_for_status()
+                return unique_name
+
+            # 1) Upload ảnh chính và các ảnh tham chiếu (nếu có)
+            image1_filename = _upload_image(input_image_path)
+            image2_filename = _upload_image(ref_image2_path) if ref_image2_path else None
+            image3_filename = _upload_image(ref_image3_path) if ref_image3_path else None
+
+            logger.info(f"Uploaded image1: {image1_filename}")
+            if image2_filename:
+                logger.info(f"Uploaded image2: {image2_filename}")
+            if image3_filename:
+                logger.info(f"Uploaded image3: {image3_filename}")
+
+            # 2) Đọc workflow Inpainting.json
+            with open("workflows/Inpainting.json", "r", encoding="utf-8") as f:
+                workflow = json.loads(f.read())
+
+            # 3) Gán ảnh vào các node tương ứng
+            # Node 78: ảnh chính (LoadImage)
+            if "78" in workflow and "inputs" in workflow["78"]:
+                workflow["78"]["inputs"]["image"] = image1_filename
+            else:
+                logger.warning("Workflow Inpainting.json không có node '78' như kỳ vọng")
+
+            # Node 106 và 108: ảnh tham chiếu (nếu cung cấp)
+            if image2_filename and "106" in workflow and "inputs" in workflow["106"]:
+                workflow["106"]["inputs"]["image"] = image2_filename
+            if image3_filename and "108" in workflow and "inputs" in workflow["108"]:
+                workflow["108"]["inputs"]["image"] = image3_filename
+
+            # 4) Cập nhật prompt cho node 111 (positive prompt)
+            if "111" in workflow and "inputs" in workflow["111"]:
+                workflow["111"]["inputs"]["prompt"] = prompt
+            else:
+                logger.warning("Workflow Inpainting.json không có node '111' như kỳ vọng để set prompt")
+
+            logger.info(f"Prepared Inpainting workflow with {len(workflow)} nodes")
+
+            # 5) Gửi workflow và theo dõi tiến độ
+            try:
+                result = self.queue_prompt_with_progress(workflow, progress_callback=progress_callback)
+                logger.info("Inpainting completed successfully (via WS)")
+            except Exception as e:
+                logger.warning(f"WS progress flow failed: {e}; falling back to queue + polling")
+                prompt_id = self.queue_prompt(workflow)
+                result = self.wait_for_completion(prompt_id)
+
+            # 6) Trích ảnh kết quả
+            outputs = result.get("outputs", {}) or {}
+            preferred = None
+            fallback = None
+            any_image = None
+
+            for node_id, out in outputs.items():
+                if not isinstance(out, dict):
+                    continue
+                images = out.get("images") or []
+                if not images:
+                    continue
+                filename = images[0].get("filename")
+                if not filename:
+                    continue
+
+                # ưu tiên node 8 (VAEDecode) nếu có, kế đến Preview 116
+                if str(node_id) == "8" and preferred is None:
+                    preferred = (node_id, filename)
+                if str(node_id) == "116" and not preferred:
+                    preferred = (node_id, filename)
+                if fallback is None:
+                    fallback = (node_id, filename)
+                if any_image is None:
+                    any_image = (node_id, filename)
+
+            if preferred:
+                return preferred[1]
+            if fallback:
+                return fallback[1]
+            if any_image:
+                return any_image[1]
+
+            raise Exception("Không tìm thấy ảnh output trong kết quả Inpainting.")
+
+        except Exception as e:
+            logger.error(f"Error processing inpainting: {str(e)}")
+            raise
