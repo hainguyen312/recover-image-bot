@@ -196,7 +196,7 @@ class ComfyUIClient:
             logger.warning(f"Network error getting progress from {self.server_url}/progress: {e}")
             return {}
     
-    def wait_for_completion(self, prompt_id: str, timeout: int = 300) -> Dict[str, Any]:
+    def wait_for_completion(self, prompt_id: str, timeout: int = 600) -> Dict[str, Any]:
         """Đợi cho đến khi xử lý hoàn tất"""
         start_time = time.time()
         
@@ -224,7 +224,7 @@ class ComfyUIClient:
         
         raise Exception(f"Timeout waiting for ComfyUI completion after {timeout} seconds")
     
-    def wait_for_completion_with_progress(self, prompt_id: str, progress_callback=None, timeout: int = 300) -> Dict[str, Any]:
+    def wait_for_completion_with_progress(self, prompt_id: str, progress_callback=None, timeout: int = 600) -> Dict[str, Any]:
         """Đợi cho đến khi xử lý hoàn tất với callback để hiển thị progress"""
         # First, try to use WebSocket to receive live progress messages from ComfyUI.
         # If websocket-client is not available or WS connection fails, fall back to HTTP polling.
@@ -348,7 +348,7 @@ class ComfyUIClient:
                 pass
 
 
-    def queue_prompt_with_progress(self, prompt: Dict[str, Any], progress_callback=None, timeout: int = 300) -> Dict[str, Any]:
+    def queue_prompt_with_progress(self, prompt: Dict[str, Any], progress_callback=None, timeout: int = 600) -> Dict[str, Any]:
         """Queue a prompt and listen for progress via WebSocket (preferred).
 
         If WebSocket isn't available or fails, falls back to queue + HTTP polling.
@@ -555,14 +555,14 @@ class ComfyUIClient:
 
             # 5) Gửi workflow và đợi kết quả (kèm progress qua WebSocket nếu có)
             try:
-                result = self.queue_prompt_with_progress(workflow, progress_callback=progress_callback)
+                result = self.queue_prompt_with_progress(workflow, progress_callback=progress_callback, timeout=600)
                 logger.info("Workflow completed successfully (via WS)")
             except Exception as e:
                 # Fallback: queue + polling
                 logger.warning(f"WS progress flow failed: {e}; falling back to queue + polling")
                 prompt_id = self.queue_prompt(workflow)
                 logger.info(f"Queued prompt {prompt_id}, waiting for completion via polling...")
-                result = self.wait_for_completion(prompt_id)
+                result = self.wait_for_completion(prompt_id, timeout=600)
 
             # 6) Lấy ảnh kết quả
             outputs = result.get("outputs", {}) or {}
@@ -698,12 +698,12 @@ class ComfyUIClient:
 
             # 5) Gửi workflow và theo dõi tiến độ
             try:
-                result = self.queue_prompt_with_progress(workflow, progress_callback=progress_callback)
+                result = self.queue_prompt_with_progress(workflow, progress_callback=progress_callback, timeout=600)
                 logger.info("Inpainting completed successfully (via WS)")
             except Exception as e:
                 logger.warning(f"WS progress flow failed: {e}; falling back to queue + polling")
                 prompt_id = self.queue_prompt(workflow)
-                result = self.wait_for_completion(prompt_id)
+                result = self.wait_for_completion(prompt_id, timeout=600)
 
             # 6) Trích ảnh kết quả
             outputs = result.get("outputs", {}) or {}

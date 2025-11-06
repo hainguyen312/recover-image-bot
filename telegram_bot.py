@@ -200,6 +200,22 @@ Sẵn sàng xử lý ảnh! 🚀
         logger.info(f"User {user_id} sent text: '{text}'")
         logger.info(f"User session: {self.user_sessions.get(user_id, 'No session')}")
         
+        # QUAN TRỌNG: Kiểm tra waiting_for_ref_images TRƯỚC waiting_for_prompt
+        # để tránh nhầm khi user nhắn "xong" trong luồng inpainting
+        if user_id in self.user_sessions and self.user_sessions[user_id].get('waiting_for_ref_images'):
+            # Người dùng nhắn 'xong' để bắt đầu xử lý inpainting
+            if text.lower() in ["xong", "done", "finish"]:
+                logger.info(f"User {user_id} confirmed ref images, starting inpainting flow")
+                await self._start_inpainting_with_refs(update, context)
+                return
+            else:
+                # Nếu không phải "xong", có thể là user đang nhắn gì đó khác
+                # Nhưng vì đang trong luồng chờ ref images, bỏ qua
+                await update.message.reply_text(
+                    "Bạn đang trong luồng gửi ảnh tham chiếu. Gửi thêm ảnh hoặc nhắn 'xong' để bắt đầu."
+                )
+                return
+        
         # Người dùng đang ở bước nhập prompt -> phân loại workflow tự động
         if user_id in self.user_sessions and self.user_sessions[user_id].get('waiting_for_prompt'):
             logger.info(f"Classifying prompt for user {user_id}: '{text}'")
@@ -208,6 +224,7 @@ Sẵn sàng xử lý ảnh! 🚀
 
             selected = self.classify_workflow(text)
             self.user_sessions[user_id]['selected_workflow'] = selected
+            logger.info(f"Classified workflow: {selected}")
 
             if selected == 'restore':
                 await self.process_image_recovery(update, context, text)
@@ -215,6 +232,7 @@ Sẵn sàng xử lý ảnh! 🚀
 
             # Inpainting: hỏi người dùng có muốn gửi ảnh tham chiếu
             self.user_sessions[user_id]['awaiting_ref_choice'] = True
+            self.user_sessions[user_id]['waiting_for_prompt'] = False  # Tắt flag này để tránh nhầm
             keyboard = [
                 [
                     InlineKeyboardButton("➕ Gửi ảnh tham chiếu", callback_data="inpaint_add_ref"),
@@ -227,13 +245,6 @@ Sẵn sàng xử lý ảnh! 🚀
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
-
-        # Nếu đang chờ người dùng gửi ảnh tham chiếu (inpainting)
-        if user_id in self.user_sessions and self.user_sessions[user_id].get('waiting_for_ref_images'):
-            # Người dùng nhắn 'xong' để bắt đầu xử lý
-            if text.lower() in ["xong", "done", "finish"]:
-                await self._start_inpainting_with_refs(update, context)
-                return
         
         # Xử lý các lệnh khác
         if text.startswith('/'):
@@ -440,7 +451,8 @@ Sẵn sàng xử lý ảnh! 🚀
             result = await asyncio.to_thread(
                 client.queue_prompt_with_progress,
                 workflow,
-                _thread_progress_cb
+                _thread_progress_cb,
+                600  # timeout 600 giây (10 phút)
             )
             
             logger.info(f"Workflow completed successfully")
@@ -489,7 +501,7 @@ Sẵn sàng xử lý ảnh! 🚀
             logger.error(f"Error processing image recovery: {str(e)}")
             raise
     
-    async def _wait_for_completion_with_progress(self, client: ComfyUIClient, prompt_id: str, progress_callback, timeout: int = 300):
+    async def _wait_for_completion_with_progress(self, client: ComfyUIClient, prompt_id: str, progress_callback, timeout: int = 600):
         """Đợi cho đến khi xử lý hoàn tất với progress tracking"""
         import time
         start_time = time.time()
@@ -580,7 +592,17 @@ Sẵn sàng xử lý ảnh! 🚀
     
     async def run(self):
         """Chạy bot"""
-        self.application = Application.builder().token(self.token).build()
+        # Tăng timeout cho download file lên 600 giây (10 phút)
+        # Điều này giúp tránh timeout khi download ảnh lớn từ Telegram
+        self.application = (
+            Application.builder()
+            .token(self.token)
+            .read_timeout(600)  # Timeout cho read operations (download file) - 10 phút
+            .write_timeout(600)  # Timeout cho write operations - 10 phút
+            .connect_timeout(60)  # Timeout cho connection - 1 phút
+            .build()
+        )
+        # Setup handlers sau khi tạo application
         self.setup_handlers()
         
         logger.info("Starting Telegram bot...")
@@ -666,6 +688,12 @@ Sẵn sàng xử lý ảnh! 🚀
     async def _process_inpainting_flow(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, ref_file_ids):
         user_id = update.effective_user.id
         processing_msg = None
+        
+        logger.info("=== STARTING INPAINTING FLOW ===")
+        logger.info(f"User ID: {user_id}")
+        logger.info(f"Prompt: {prompt}")
+        logger.info(f"Ref file IDs count: {len(ref_file_ids)}")
+        
         try:
             comfy = ComfyUIClient()
             if not comfy.health_check():
@@ -678,22 +706,92 @@ Sẵn sàng xử lý ảnh! 🚀
                 parse_mode=ParseMode.MARKDOWN
             )
 
+            logger.info("Downloading main image from Telegram...")
             photo_file_id = self.user_sessions[user_id]['photo_file_id']
-            main_file = await context.bot.get_file(photo_file_id)
+            
+            # Retry download với timeout dài hơn
+            max_retries = 3
+            main_file = None
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"Getting file info (attempt {attempt + 1}/{max_retries})...")
+                    main_file = await context.bot.get_file(photo_file_id)
+                    logger.info(f"Main file info: {main_file.file_id}, size: {main_file.file_size}")
+                    break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    logger.warning(f"Failed to get file info (attempt {attempt + 1}): {e}, retrying...")
+                    await asyncio.sleep(2)
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 main_path = os.path.join(tmpdir, "input.jpg")
-                await main_file.download_to_drive(main_path)
+                logger.info(f"Downloading main image to: {main_path}")
+                
+                # Retry download với timeout dài hơn
+                for attempt in range(max_retries):
+                    try:
+                        await main_file.download_to_drive(main_path)
+                        file_size = os.path.getsize(main_path)
+                        logger.info(f"✅ Main image downloaded: {file_size} bytes")
+                        break
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            raise
+                        logger.warning(f"Download failed (attempt {attempt + 1}): {e}, retrying...")
+                        await asyncio.sleep(2)
+                        # Lấy lại file object nếu cần
+                        if attempt < max_retries - 1:
+                            try:
+                                main_file = await context.bot.get_file(photo_file_id)
+                            except:
+                                pass
 
                 ref_paths = []
                 for idx, fid in enumerate(ref_file_ids[:2]):
                     try:
-                        f = await context.bot.get_file(fid)
+                        logger.info(f"Downloading ref image {idx+1} from Telegram...")
+                        
+                        # Retry download ref image
+                        ref_file = None
+                        for attempt in range(max_retries):
+                            try:
+                                ref_file = await context.bot.get_file(fid)
+                                logger.info(f"Ref image {idx+1} file info: {ref_file.file_id}, size: {ref_file.file_size}")
+                                break
+                            except Exception as e:
+                                if attempt == max_retries - 1:
+                                    raise
+                                logger.warning(f"Failed to get ref file info (attempt {attempt + 1}): {e}, retrying...")
+                                await asyncio.sleep(2)
+                        
                         ref_path = os.path.join(tmpdir, f"ref_{idx+1}.jpg")
-                        await f.download_to_drive(ref_path)
-                        ref_paths.append(ref_path)
+                        logger.info(f"Downloading ref image {idx+1} to: {ref_path}")
+                        
+                        # Retry download
+                        for attempt in range(max_retries):
+                            try:
+                                await ref_file.download_to_drive(ref_path)
+                                file_size = os.path.getsize(ref_path)
+                                logger.info(f"✅ Ref image {idx+1} downloaded: {file_size} bytes")
+                                ref_paths.append(ref_path)
+                                break
+                            except Exception as e:
+                                if attempt == max_retries - 1:
+                                    raise
+                                logger.warning(f"Ref download failed (attempt {attempt + 1}): {e}, retrying...")
+                                await asyncio.sleep(2)
+                                # Lấy lại file object nếu cần
+                                if attempt < max_retries - 1:
+                                    try:
+                                        ref_file = await context.bot.get_file(fid)
+                                    except:
+                                        pass
                     except Exception as e:
-                        logger.warning(f"Failed to download ref image {fid}: {e}")
+                        logger.error(f"❌ Failed to download ref image {fid}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        # Tiếp tục với các ref image khác nếu có
 
                 client = ComfyUIClient()
 
@@ -736,6 +834,22 @@ Sẵn sàng xử lý ảnh! 🚀
                         logger.warning(f"Could not update progress: {e}")
 
                 # Chạy process_inpainting trong thread, có progress
+                logger.info("Building inpainting workflow...")
+                try:
+                    # Build workflow trong thread để tránh block event loop
+                    workflow = await asyncio.to_thread(
+                        self._build_inpainting_workflow,
+                        main_path,
+                        prompt,
+                        ref_paths
+                    )
+                    logger.info(f"✅ Workflow built successfully with {len(workflow)} nodes")
+                except Exception as e:
+                    logger.error(f"❌ Failed to build inpainting workflow: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    raise
+                
                 loop = asyncio.get_running_loop()
 
                 def _thread_progress_cb(data):
@@ -744,11 +858,20 @@ Sẵn sàng xử lý ảnh! 🚀
                     except Exception as e:
                         logger.warning(f"Failed to schedule progress callback: {e}")
 
-                result = await asyncio.to_thread(
-                    client.queue_prompt_with_progress,
-                    self._build_inpainting_workflow(main_path, prompt, ref_paths),
-                    _thread_progress_cb,
-                )
+                logger.info("Queueing inpainting workflow to ComfyUI...")
+                try:
+                    result = await asyncio.to_thread(
+                        client.queue_prompt_with_progress,
+                        workflow,
+                        _thread_progress_cb,
+                        600  # timeout 600 giây (10 phút)
+                    )
+                    logger.info("✅ Inpainting workflow completed successfully")
+                except Exception as e:
+                    logger.error(f"❌ Failed to queue/execute inpainting workflow: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    raise
 
                 # Lấy ảnh kết quả
                 outputs = result.get("outputs", {}) or {}
@@ -797,91 +920,137 @@ Sẵn sàng xử lý ảnh! 🚀
             self.user_sessions[user_id].pop('ref_file_ids', None)
             self.user_sessions[user_id].pop('workflow_prompt', None)
 
+        except asyncio.TimeoutError as e:
+            logger.error(f"Timeout error in inpainting flow: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            if processing_msg:
+                try:
+                    await processing_msg.delete()
+                except:
+                    pass
+            await update.message.reply_text(
+                "⏱️ Đã hết thời gian chờ khi xử lý inpainting.\n\n"
+                "Có thể do:\n"
+                "- Ảnh quá lớn, mất nhiều thời gian upload\n"
+                "- ComfyUI đang xử lý task khác\n"
+                "- Kết nối mạng chậm\n\n"
+                "Vui lòng thử lại sau."
+            )
         except Exception as e:
             logger.error(f"Error processing inpainting: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             if processing_msg:
                 try:
                     await processing_msg.delete()
                 except:
                     pass
             msg = str(e)
-            if "Failed to queue prompt" in msg or "Network error queueing prompt" in msg or "Timeout" in msg:
+            if "Failed to queue prompt" in msg or "Network error queueing prompt" in msg or "Timeout" in msg or "Timed out" in msg:
                 friendly = (
-                    "❌ Không thể kết nối ComfyUI.\n\n"
+                    "❌ Không thể kết nối ComfyUI hoặc đã hết thời gian chờ.\n\n"
                     "- Kiểm tra COMFYUI_SERVER_URL (không dùng localhost nếu bot chạy khác máy).\n"
                     "- Đảm bảo ComfyUI đang chạy và mở port 8188.\n"
-                    "- Kiểm tra firewall hoặc Docker network."
+                    "- Kiểm tra firewall hoặc Docker network.\n"
+                    "- Thử lại với ảnh nhỏ hơn."
                 )
             else:
                 friendly = f"❌ Đã xảy ra lỗi: {msg}"
             await update.message.reply_text(friendly)
 
-def _build_inpainting_workflow(self, main_path: str, prompt: str, ref_paths: list) -> dict:
-    """Xây dựng dict workflow Inpainting.json với ảnh đã upload vào ComfyUI."""
-    import time
-    import uuid
-    import os
-    
-    client = ComfyUIClient()
-    
-    # Upload ảnh
-    def _upload(local_path: str) -> str:
-        timestamp = int(time.time())
-        uid = uuid.uuid4().hex[:8]
-        base, ext = os.path.splitext(os.path.basename(local_path))
-        unique = f"{base}_{timestamp}_{uid}{ext}"
-        url = f"{client.server_url.rstrip('/')}/upload/image"
-        with open(local_path, 'rb') as f:
-            files = {"image": (unique, f, "application/octet-stream")}
-            r = requests.post(url, files=files)
-            r.raise_for_status()
-        return unique
-
-    # Upload ảnh chính và refs
-    img1 = _upload(main_path)
-    img2 = _upload(ref_paths[0]) if len(ref_paths) > 0 else None
-    img3 = _upload(ref_paths[1]) if len(ref_paths) > 1 else None
-
-    logger.info(f"Uploaded images: img1={img1}, img2={img2}, img3={img3}")
-
-    # Đọc workflow template
-    with open("workflows/Inpainting.json", "r", encoding="utf-8") as f:
-        wf = json.loads(f.read())
-    
-    # Node 78: ảnh chính (bắt buộc)
-    if "78" in wf and "inputs" in wf["78"]:
-        wf["78"]["inputs"]["image"] = img1
-    
-    # Node 106: ref image 2 (tùy chọn)
-    if img2 and "106" in wf and "inputs" in wf["106"]:
-        wf["106"]["inputs"]["image"] = img2
-    
-    # Node 108: ref image 3 (tùy chọn)
-    if img3 and "108" in wf and "inputs" in wf["108"]:
-        wf["108"]["inputs"]["image"] = img3
-    
-    # Node 111: TextEncodeQwenImageEditPlus (positive prompt)
-    if "111" in wf and "inputs" in wf["111"]:
-        wf["111"]["inputs"]["prompt"] = prompt
+    def _build_inpainting_workflow(self, main_path: str, prompt: str, ref_paths: list) -> dict:
+        """Xây dựng dict workflow Inpainting.json với ảnh đã upload vào ComfyUI."""
+        import time
+        import uuid
+        import os
         
-        # QUAN TRỌNG: Xóa image2/image3 nếu không có
-        if not img2 and "image2" in wf["111"]["inputs"]:
-            del wf["111"]["inputs"]["image2"]
-            logger.info("Removed image2 from node 111 (no ref image 2)")
+        logger.info("=== BUILDING INPAINTING WORKFLOW ===")
+        logger.info(f"Main image path: {main_path}")
+        logger.info(f"Prompt: {prompt}")
+        logger.info(f"Ref paths count: {len(ref_paths)}")
         
-        if not img3 and "image3" in wf["111"]["inputs"]:
-            del wf["111"]["inputs"]["image3"]
-            logger.info("Removed image3 from node 111 (no ref image 3)")
+        client = ComfyUIClient()
+        
+        # Upload ảnh
+        def _upload(local_path: str) -> str:
+            timestamp = int(time.time())
+            uid = uuid.uuid4().hex[:8]
+            base, ext = os.path.splitext(os.path.basename(local_path))
+            unique = f"{base}_{timestamp}_{uid}{ext}"
+            url = f"{client.server_url.rstrip('/')}/upload/image"
+            with open(local_path, 'rb') as f:
+                files = {"image": (unique, f, "application/octet-stream")}
+                r = requests.post(url, files=files)
+                r.raise_for_status()
+            logger.info(f"Uploaded image to ComfyUI: {unique}")
+            return unique
+
+        # Upload ảnh chính và refs
+        img1 = _upload(main_path)
+        img2 = _upload(ref_paths[0]) if len(ref_paths) > 0 else None
+        img3 = _upload(ref_paths[1]) if len(ref_paths) > 1 else None
+
+        logger.info(f"Uploaded images: img1={img1}, img2={img2}, img3={img3}")
+
+        # Đọc workflow template
+        workflow_path = "workflows/Inpainting.json"
+        logger.info(f"Reading workflow from: {workflow_path}")
+        with open(workflow_path, "r", encoding="utf-8") as f:
+            wf = json.loads(f.read())
+        
+        logger.info(f"Loaded Inpainting.json with {len(wf)} nodes")
+        
+        # Node 78: ảnh chính (bắt buộc)
+        if "78" in wf and "inputs" in wf["78"]:
+            wf["78"]["inputs"]["image"] = img1
+            logger.info(f"Set node 78 (main image) to: {img1}")
+        else:
+            logger.warning("Node 78 not found in workflow!")
     
-    # Node 110: negative prompt (cũng cần xóa nếu không có refs)
-    if "110" in wf and "inputs" in wf["110"]:
-        if not img2 and "image2" in wf["110"]["inputs"]:
-            del wf["110"]["inputs"]["image2"]
-        if not img3 and "image3" in wf["110"]["inputs"]:
-            del wf["110"]["inputs"]["image3"]
+        # Node 106: ref image 2 (tùy chọn)
+        if img2 and "106" in wf and "inputs" in wf["106"]:
+            wf["106"]["inputs"]["image"] = img2
+            logger.info(f"Set node 106 (ref image 2) to: {img2}")
+        elif img2:
+            logger.warning("Node 106 not found in workflow but ref_image2 provided!")
     
-    logger.info(f"Built inpainting workflow with {len(wf)} nodes")
-    return wf
+        # Node 108: ref image 3 (tùy chọn)
+        if img3 and "108" in wf and "inputs" in wf["108"]:
+            wf["108"]["inputs"]["image"] = img3
+            logger.info(f"Set node 108 (ref image 3) to: {img3}")
+        elif img3:
+            logger.warning("Node 108 not found in workflow but ref_image3 provided!")
+    
+        # Node 111: TextEncodeQwenImageEditPlus (positive prompt)
+        if "111" in wf and "inputs" in wf["111"]:
+            wf["111"]["inputs"]["prompt"] = prompt
+            logger.info(f"Set node 111 (prompt) to: {prompt}")
+            
+            # QUAN TRỌNG: Xóa image2/image3 nếu không có
+            if not img2 and "image2" in wf["111"]["inputs"]:
+                del wf["111"]["inputs"]["image2"]
+                logger.info("Removed image2 from node 111 (no ref image 2)")
+            
+            if not img3 and "image3" in wf["111"]["inputs"]:
+                del wf["111"]["inputs"]["image3"]
+                logger.info("Removed image3 from node 111 (no ref image 3)")
+        else:
+            logger.warning("Node 111 not found in workflow!")
+    
+        # Node 110: negative prompt (cũng cần xóa nếu không có refs)
+        if "110" in wf and "inputs" in wf["110"]:
+            if not img2 and "image2" in wf["110"]["inputs"]:
+                del wf["110"]["inputs"]["image2"]
+                logger.info("Removed image2 from node 110 (no ref image 2)")
+            if not img3 and "image3" in wf["110"]["inputs"]:
+                del wf["110"]["inputs"]["image3"]
+                logger.info("Removed image3 from node 110 (no ref image 3)")
+        else:
+            logger.warning("Node 110 not found in workflow!")
+    
+        logger.info(f"✅ Built inpainting workflow with {len(wf)} nodes")
+        return wf
 
 async def main():
     """Main function"""
