@@ -1,7 +1,7 @@
 {
   "3": {
     "inputs": {
-      "seed": 1032339291501069,
+      "seed": 726246609177250,
       "steps": 8,
       "cfg": 1,
       "sampler_name": "euler",
@@ -103,7 +103,7 @@
   },
   "78": {
     "inputs": {
-      "image": "pasted/image (2).png"
+      "image": "girl.jpg"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -151,12 +151,12 @@
     },
     "class_type": "ImageScaleToTotalPixels",
     "_meta": {
-      "title": "Scale Image to Total Pixels"
+      "title": "ImageScaleToTotalPixels"
     }
   },
   "106": {
     "inputs": {
-      "image": "ars.jpg"
+      "image": "ars (1).jpg"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -165,7 +165,7 @@
   },
   "108": {
     "inputs": {
-      "image": "beach.jpg"
+      "image": "beach (2).jpg"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -203,7 +203,7 @@
   },
   "111": {
     "inputs": {
-      "prompt": "Change the man's shirt to the white shirt in the image2 and change background to the beach and blend the lighting so it look natural\n",
+      "prompt": "Change the woman's shirt to the white shirt in the image2 and change background to the beach in the image3 and blend the lighting so it look natural\n",
       "clip": [
         "38",
         0
@@ -242,13 +242,38 @@
   "116": {
     "inputs": {
       "images": [
-        "8",
+        "117",
         0
       ]
     },
     "class_type": "PreviewImage",
     "_meta": {
       "title": "Preview Image"
+    }
+  },
+  "117": {
+    "inputs": {
+      "upscale_model": [
+        "118",
+        0
+      ],
+      "image": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "ImageUpscaleWithModel",
+    "_meta": {
+      "title": "Upscale Image (using Model)"
+    }
+  },
+  "118": {
+    "inputs": {
+      "model_name": "remacri_original.safetensors"
+    },
+    "class_type": "UpscaleModelLoader",
+    "_meta": {
+      "title": "Load Upscale Model"
     }
   }
 }
