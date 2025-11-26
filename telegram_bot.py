@@ -682,7 +682,10 @@ Sẵn sàng xử lý ảnh! 🚀
         sess = self.user_sessions.get(user_id, {})
         prompt = sess.get('workflow_prompt', '')
         ref_ids = sess.get('ref_file_ids', [])
-        await update.message.reply_text("🔄 Bắt đầu xử lý inpainting với ảnh tham chiếu...")
+        # Lấy message từ effective_message để hỗ trợ cả callback query và message
+        message = update.effective_message or (update.callback_query.message if update.callback_query else None)
+        if message:
+            await message.reply_text("🔄 Bắt đầu xử lý inpainting với ảnh tham chiếu...")
         await self._process_inpainting_flow(update, context, prompt, ref_ids)
 
     async def _process_inpainting_flow(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, ref_file_ids):
@@ -694,14 +697,33 @@ Sẵn sàng xử lý ảnh! 🚀
         logger.info(f"Prompt: {prompt}")
         logger.info(f"Ref file IDs count: {len(ref_file_ids)}")
         
+        # Lấy message object - có thể từ callback query hoặc message
+        # effective_message sẽ trả về message từ callback query nếu có, hoặc message từ update
+        message = update.effective_message
+        if message is None:
+            # Fallback: thử lấy từ callback query
+            if update.callback_query and update.callback_query.message:
+                message = update.callback_query.message
+            else:
+                logger.error("Cannot find message object in update")
+                # Thử gửi tin nhắn mới bằng context.bot
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text="❌ Lỗi: Không thể xác định tin nhắn để phản hồi."
+                    )
+                except:
+                    pass
+                return
+        
         try:
             comfy = ComfyUIClient()
             if not comfy.health_check():
-                await update.message.reply_text(
+                await message.reply_text(
                     "❌ Không thể kết nối ComfyUI. Hãy kiểm tra cấu hình COMFYUI_SERVER_URL, port 8188, và firewall rồi thử lại.")
                 return
 
-            processing_msg = await update.message.reply_text(
+            processing_msg = await message.reply_text(
                 "🔄 Đang xử lý inpainting... Vui lòng chờ trong giây lát...",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -909,9 +931,9 @@ Sẵn sàng xử lý ảnh! 🚀
             try:
                 public_url = await self.storage.upload_image(img_bytes, chosen, content_type="image/png")
             except Exception:
-                await update.message.reply_photo(photo=BytesIO(img_bytes), caption=f"🎨 Ảnh đã được chỉnh!")
+                await message.reply_photo(photo=BytesIO(img_bytes), caption=f"🎨 Ảnh đã được chỉnh!")
             else:
-                await update.message.reply_photo(photo=public_url, caption=f"🎨 Ảnh đã được chỉnh!")
+                await message.reply_photo(photo=public_url, caption=f"🎨 Ảnh đã được chỉnh!")
 
             # Reset session flags
             self.user_sessions[user_id]['waiting_for_prompt'] = False
@@ -929,14 +951,20 @@ Sẵn sàng xử lý ảnh! 🚀
                     await processing_msg.delete()
                 except:
                     pass
-            await update.message.reply_text(
-                "⏱️ Đã hết thời gian chờ khi xử lý inpainting.\n\n"
-                "Có thể do:\n"
-                "- Ảnh quá lớn, mất nhiều thời gian upload\n"
-                "- ComfyUI đang xử lý task khác\n"
-                "- Kết nối mạng chậm\n\n"
-                "Vui lòng thử lại sau."
-            )
+            if message:
+                await message.reply_text(
+                    "⏱️ Đã hết thời gian chờ khi xử lý inpainting.\n\n"
+                    "Có thể do:\n"
+                    "- Ảnh quá lớn, mất nhiều thời gian upload\n"
+                    "- ComfyUI đang xử lý task khác\n"
+                    "- Kết nối mạng chậm\n\n"
+                    "Vui lòng thử lại sau."
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="⏱️ Đã hết thời gian chờ khi xử lý inpainting."
+                )
         except Exception as e:
             logger.error(f"Error processing inpainting: {str(e)}")
             import traceback
@@ -957,7 +985,10 @@ Sẵn sàng xử lý ảnh! 🚀
                 )
             else:
                 friendly = f"❌ Đã xảy ra lỗi: {msg}"
-            await update.message.reply_text(friendly)
+            if message:
+                await message.reply_text(friendly)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=friendly)
 
     def _build_inpainting_workflow(self, main_path: str, prompt: str, ref_paths: list) -> dict:
         """Xây dựng dict workflow Inpainting.json với ảnh đã upload vào ComfyUI."""
