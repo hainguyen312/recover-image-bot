@@ -8,6 +8,7 @@ from typing import Dict, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 import httpx
 from io import BytesIO
 from PIL import Image
@@ -928,12 +929,32 @@ Sẵn sàng xử lý ảnh! 🚀
                 await processing_msg.delete()
 
             # Upload ảnh kết quả
+            public_url = None
             try:
-                public_url = await self.storage.upload_image(img_bytes, chosen, content_type="image/png")
-            except Exception:
-                await message.reply_photo(photo=BytesIO(img_bytes), caption=f"🎨 Ảnh đã được chỉnh!")
-            else:
-                await message.reply_photo(photo=public_url, caption=f"🎨 Ảnh đã được chỉnh!")
+                public_url = await self.storage.upload_image(
+                    img_bytes,
+                    chosen,
+                    content_type="image/png"
+                )
+            except Exception as upload_err:
+                logger.warning(f"Failed to upload image to storage, sending bytes directly: {upload_err}")
+
+            caption = "🎨 Ảnh đã được chỉnh!"
+            if public_url:
+                caption += f"\n\n🔗 Xem trực tuyến: {public_url}"
+
+            try:
+                await message.reply_photo(photo=BytesIO(img_bytes), caption=caption)
+            except BadRequest as send_err:
+                logger.warning(f"Telegram refused photo upload, falling back to raw URL: {send_err}")
+                if public_url:
+                    await message.reply_text(
+                        "⚠️ Telegram không thể tải ảnh do dung lượng lớn.\n"
+                        "Bạn có thể tải trực tiếp bằng liên kết sau:\n"
+                        f"{public_url}"
+                    )
+                else:
+                    raise
 
             # Reset session flags
             self.user_sessions[user_id]['waiting_for_prompt'] = False
